@@ -1,60 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1761307335438,
+  "lastUpdate": 1761311341578,
   "repoUrl": "https://github.com/czlonkowski/n8n-mcp",
   "entries": {
     "n8n-mcp Benchmarks": [
-      {
-        "commit": {
-          "author": {
-            "email": "56956555+czlonkowski@users.noreply.github.com",
-            "name": "Romuald Członkowski",
-            "username": "czlonkowski"
-          },
-          "committer": {
-            "email": "noreply@github.com",
-            "name": "GitHub",
-            "username": "web-flow"
-          },
-          "distinct": true,
-          "id": "57459c27e388cdc90423161957a275774bb91868",
-          "message": "Merge pull request #264 from czlonkowski/feat/integration-tests-phase-6\n\nfeat: Phase 6B integration tests (workflow autofix)",
-          "timestamp": "2025-10-05T09:59:27+02:00",
-          "tree_id": "d0693e21af7849ecf8b72faa333a4062d85a04a6",
-          "url": "https://github.com/czlonkowski/n8n-mcp/commit/57459c27e388cdc90423161957a275774bb91868"
-        },
-        "date": 1759651278794,
-        "tool": "customSmallerIsBetter",
-        "benches": [
-          {
-            "name": "sample - array sorting - small",
-            "value": 0.0195,
-            "range": "0.4034",
-            "unit": "ms",
-            "extra": "51205 ops/sec"
-          },
-          {
-            "name": "sample - array sorting - large",
-            "value": 3.239,
-            "range": "0.7762000000000002",
-            "unit": "ms",
-            "extra": "309 ops/sec"
-          },
-          {
-            "name": "sample - string concatenation",
-            "value": 0.0048,
-            "range": "0.30210000000000004",
-            "unit": "ms",
-            "extra": "207059 ops/sec"
-          },
-          {
-            "name": "sample - object creation",
-            "value": 0.0695,
-            "range": "0.40149999999999997",
-            "unit": "ms",
-            "extra": "14379 ops/sec"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -1836,6 +1784,37 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/czlonkowski/n8n-mcp/commit/913ff31164351a04e9c7a3c4fe550f8222e8ab62"
         },
         "date": 1761307335146,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "sample - array sorting - small",
+            "value": 0.0136,
+            "range": "0.3096",
+            "unit": "ms",
+            "extra": "73341 ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "56956555+czlonkowski@users.noreply.github.com",
+            "name": "Romuald Członkowski",
+            "username": "czlonkowski"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b18f6ec7a425aa60a4dd35957c69a29bb338a641",
+          "message": "Merge pull request #364 from czlonkowski/fix/if-node-connection-separation\n\nfix: add warnings for If/Switch node connection parameters (issue #360)",
+          "timestamp": "2025-10-24T15:06:58+02:00",
+          "tree_id": "cccebf3d1bc7262fdf0602056613af80eeb1175a",
+          "url": "https://github.com/czlonkowski/n8n-mcp/commit/b18f6ec7a425aa60a4dd35957c69a29bb338a641"
+        },
+        "date": 1761311340815,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
