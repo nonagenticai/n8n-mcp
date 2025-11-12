@@ -4,7 +4,7 @@
  */
 
 import { SupabaseClient } from '@supabase/supabase-js';
-import { TelemetryEvent, WorkflowTelemetry, TELEMETRY_CONFIG, TelemetryMetrics } from './telemetry-types';
+import { TelemetryEvent, WorkflowTelemetry, WorkflowMutationRecord, TELEMETRY_CONFIG, TelemetryMetrics } from './telemetry-types';
 import { TelemetryError, TelemetryErrorType, TelemetryCircuitBreaker } from './telemetry-error';
 import { logger } from '../utils/logger';
 
@@ -12,6 +12,7 @@ export class TelemetryBatchProcessor {
   private flushTimer?: NodeJS.Timeout;
   private isFlushingEvents: boolean = false;
   private isFlushingWorkflows: boolean = false;
+  private isFlushingMutations: boolean = false;
   private circuitBreaker: TelemetryCircuitBreaker;
   private metrics: TelemetryMetrics = {
     eventsTracked: 0,
@@ -23,7 +24,7 @@ export class TelemetryBatchProcessor {
     rateLimitHits: 0
   };
   private flushTimes: number[] = [];
-  private deadLetterQueue: (TelemetryEvent | WorkflowTelemetry)[] = [];
+  private deadLetterQueue: (TelemetryEvent | WorkflowTelemetry | WorkflowMutationRecord)[] = [];
   private readonly maxDeadLetterSize = 100;
 
   constructor(
@@ -76,15 +77,15 @@ export class TelemetryBatchProcessor {
   }
 
   /**
-   * Flush events and workflows to Supabase
+   * Flush events, workflows, and mutations to Supabase
    */
-  async flush(events?: TelemetryEvent[], workflows?: WorkflowTelemetry[]): Promise<void> {
+  async flush(events?: TelemetryEvent[], workflows?: WorkflowTelemetry[], mutations?: WorkflowMutationRecord[]): Promise<void> {
     if (!this.isEnabled() || !this.supabase) return;
 
     // Check circuit breaker
     if (!this.circuitBreaker.shouldAllow()) {
       logger.debug('Circuit breaker open - skipping flush');
-      this.metrics.eventsDropped += (events?.length || 0) + (workflows?.length || 0);
+      this.metrics.eventsDropped += (events?.length || 0) + (workflows?.length || 0) + (mutations?.length || 0);
       return;
     }
 
@@ -99,6 +100,11 @@ export class TelemetryBatchProcessor {
     // Flush workflows if provided
     if (workflows && workflows.length > 0) {
       hasErrors = !(await this.flushWorkflows(workflows)) || hasErrors;
+    }
+
+    // Flush mutations if provided
+    if (mutations && mutations.length > 0) {
+      hasErrors = !(await this.flushMutations(mutations)) || hasErrors;
     }
 
     // Record flush time
@@ -225,6 +231,57 @@ export class TelemetryBatchProcessor {
   }
 
   /**
+   * Flush workflow mutations with batching
+   */
+  private async flushMutations(mutations: WorkflowMutationRecord[]): Promise<boolean> {
+    if (this.isFlushingMutations || mutations.length === 0) return true;
+
+    this.isFlushingMutations = true;
+
+    try {
+      // Batch mutations
+      const batches = this.createBatches(mutations, TELEMETRY_CONFIG.MAX_BATCH_SIZE);
+
+      for (const batch of batches) {
+        const result = await this.executeWithRetry(async () => {
+          const { error } = await this.supabase!
+            .from('workflow_mutations')
+            .insert(batch);
+
+          if (error) {
+            throw error;
+          }
+
+          logger.debug(`Flushed batch of ${batch.length} workflow mutations`);
+          return true;
+        }, 'Flush workflow mutations');
+
+        if (result) {
+          this.metrics.eventsTracked += batch.length;
+          this.metrics.batchesSent++;
+        } else {
+          this.metrics.eventsFailed += batch.length;
+          this.metrics.batchesFailed++;
+          this.addToDeadLetterQueue(batch);
+          return false;
+        }
+      }
+
+      return true;
+    } catch (error) {
+      logger.debug('Failed to flush mutations:', error);
+      throw new TelemetryError(
+        TelemetryErrorType.NETWORK_ERROR,
+        'Failed to flush workflow mutations',
+        { error: error instanceof Error ? error.message : String(error) },
+        true
+      );
+    } finally {
+      this.isFlushingMutations = false;
+    }
+  }
+
+  /**
    * Execute operation with exponential backoff retry
    */
   private async executeWithRetry<T>(
@@ -305,7 +362,7 @@ export class TelemetryBatchProcessor {
   /**
    * Add failed items to dead letter queue
    */
-  private addToDeadLetterQueue(items: (TelemetryEvent | WorkflowTelemetry)[]): void {
+  private addToDeadLetterQueue(items: (TelemetryEvent | WorkflowTelemetry | WorkflowMutationRecord)[]): void {
     for (const item of items) {
       this.deadLetterQueue.push(item);
 

@@ -51,6 +51,7 @@ const workflowDiffSchema = z.object({
   validateOnly: z.boolean().optional(),
   continueOnError: z.boolean().optional(),
   createBackup: z.boolean().optional(),
+  intent: z.string().optional(),
 });
 
 export async function handleUpdatePartialWorkflow(
@@ -58,20 +59,24 @@ export async function handleUpdatePartialWorkflow(
   repository: NodeRepository,
   context?: InstanceContext
 ): Promise<McpToolResponse> {
+  const startTime = Date.now();
+  const sessionId = `mutation_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
+  let workflowBefore: any = null;
+
   try {
     // Debug logging (only in debug mode)
     if (process.env.DEBUG_MCP === 'true') {
       logger.debug('Workflow diff request received', {
         argsType: typeof args,
         hasWorkflowId: args && typeof args === 'object' && 'workflowId' in args,
-        operationCount: args && typeof args === 'object' && 'operations' in args ? 
+        operationCount: args && typeof args === 'object' && 'operations' in args ?
           (args as any).operations?.length : 0
       });
     }
-    
+
     // Validate input
     const input = workflowDiffSchema.parse(args);
-    
+
     // Get API client
     const client = getN8nApiClient(context);
     if (!client) {
@@ -80,11 +85,13 @@ export async function handleUpdatePartialWorkflow(
         error: 'n8n API not configured. Please set N8N_API_URL and N8N_API_KEY environment variables.'
       };
     }
-    
+
     // Fetch current workflow
     let workflow;
     try {
       workflow = await client.getWorkflow(input.id);
+      // Store original workflow for telemetry
+      workflowBefore = JSON.parse(JSON.stringify(workflow));
     } catch (error) {
       if (error instanceof N8nApiError) {
         return {
@@ -282,6 +289,20 @@ export async function handleUpdatePartialWorkflow(
         }
       }
 
+      // Track successful mutation
+      if (workflowBefore && !input.validateOnly) {
+        await trackWorkflowMutation({
+          sessionId,
+          toolName: 'n8n_update_partial_workflow',
+          userIntent: input.intent || 'Partial workflow update',
+          operations: input.operations,
+          workflowBefore,
+          workflowAfter: finalWorkflow,
+          mutationSuccess: true,
+          durationMs: Date.now() - startTime,
+        }).catch(err => logger.debug('Failed to track mutation telemetry:', err));
+      }
+
       return {
         success: true,
         data: finalWorkflow,
@@ -298,6 +319,21 @@ export async function handleUpdatePartialWorkflow(
         }
       };
     } catch (error) {
+      // Track failed mutation
+      if (workflowBefore && !input.validateOnly) {
+        await trackWorkflowMutation({
+          sessionId,
+          toolName: 'n8n_update_partial_workflow',
+          userIntent: input.intent || 'Partial workflow update',
+          operations: input.operations,
+          workflowBefore,
+          workflowAfter: workflowBefore, // No change since it failed
+          mutationSuccess: false,
+          mutationError: error instanceof Error ? error.message : 'Unknown error',
+          durationMs: Date.now() - startTime,
+        }).catch(err => logger.debug('Failed to track mutation telemetry:', err));
+      }
+
       if (error instanceof N8nApiError) {
         return {
           success: false,
@@ -316,12 +352,25 @@ export async function handleUpdatePartialWorkflow(
         details: { errors: error.errors }
       };
     }
-    
+
     logger.error('Failed to update partial workflow', error);
     return {
       success: false,
       error: error instanceof Error ? error.message : 'Unknown error occurred'
     };
+  }
+}
+
+/**
+ * Track workflow mutation for telemetry
+ */
+async function trackWorkflowMutation(data: any): Promise<void> {
+  try {
+    const { telemetry } = await import('../telemetry/telemetry-manager.js');
+    await telemetry.trackWorkflowMutation(data);
+  } catch (error) {
+    // Silently fail - telemetry should never break core functionality
+    logger.debug('Telemetry tracking failed:', error);
   }
 }
 

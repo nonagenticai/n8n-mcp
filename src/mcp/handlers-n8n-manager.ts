@@ -365,6 +365,7 @@ const updateWorkflowSchema = z.object({
   connections: z.record(z.any()).optional(),
   settings: z.any().optional(),
   createBackup: z.boolean().optional(),
+  intent: z.string().optional(),
 });
 
 const listWorkflowsSchema = z.object({
@@ -700,15 +701,22 @@ export async function handleUpdateWorkflow(
   repository: NodeRepository,
   context?: InstanceContext
 ): Promise<McpToolResponse> {
+  const startTime = Date.now();
+  const sessionId = `mutation_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
+  let workflowBefore: any = null;
+  let userIntent = 'Full workflow update';
+
   try {
     const client = ensureApiConfigured(context);
     const input = updateWorkflowSchema.parse(args);
-    const { id, createBackup, ...updateData } = input;
+    const { id, createBackup, intent, ...updateData } = input;
+    userIntent = intent || 'Full workflow update';
 
     // If nodes/connections are being updated, validate the structure
     if (updateData.nodes || updateData.connections) {
       // Always fetch current workflow for validation (need all fields like name)
       const current = await client.getWorkflow(id);
+      workflowBefore = JSON.parse(JSON.stringify(current));
 
       // Create backup before modifying workflow (default: true)
       if (createBackup !== false) {
@@ -751,13 +759,42 @@ export async function handleUpdateWorkflow(
 
     // Update workflow
     const workflow = await client.updateWorkflow(id, updateData);
-    
+
+    // Track successful mutation
+    if (workflowBefore) {
+      await trackWorkflowMutationForFullUpdate({
+        sessionId,
+        toolName: 'n8n_update_full_workflow',
+        userIntent,
+        operations: [], // Full update doesn't use diff operations
+        workflowBefore,
+        workflowAfter: workflow,
+        mutationSuccess: true,
+        durationMs: Date.now() - startTime,
+      }).catch(err => logger.debug('Failed to track mutation telemetry:', err));
+    }
+
     return {
       success: true,
       data: workflow,
       message: `Workflow "${workflow.name}" updated successfully`
     };
   } catch (error) {
+    // Track failed mutation
+    if (workflowBefore) {
+      await trackWorkflowMutationForFullUpdate({
+        sessionId,
+        toolName: 'n8n_update_full_workflow',
+        userIntent,
+        operations: [],
+        workflowBefore,
+        workflowAfter: workflowBefore, // No change since it failed
+        mutationSuccess: false,
+        mutationError: error instanceof Error ? error.message : 'Unknown error',
+        durationMs: Date.now() - startTime,
+      }).catch(err => logger.debug('Failed to track mutation telemetry:', err));
+    }
+
     if (error instanceof z.ZodError) {
       return {
         success: false,
@@ -765,7 +802,7 @@ export async function handleUpdateWorkflow(
         details: { errors: error.errors }
       };
     }
-    
+
     if (error instanceof N8nApiError) {
       return {
         success: false,
@@ -774,11 +811,24 @@ export async function handleUpdateWorkflow(
         details: error.details as Record<string, unknown> | undefined
       };
     }
-    
+
     return {
       success: false,
       error: error instanceof Error ? error.message : 'Unknown error occurred'
     };
+  }
+}
+
+/**
+ * Track workflow mutation for telemetry (full workflow updates)
+ */
+async function trackWorkflowMutationForFullUpdate(data: any): Promise<void> {
+  try {
+    const { telemetry } = await import('../telemetry/telemetry-manager.js');
+    await telemetry.trackWorkflowMutation(data);
+  } catch (error) {
+    // Silently fail - telemetry should never break core functionality
+    logger.debug('Telemetry tracking failed:', error);
   }
 }
 

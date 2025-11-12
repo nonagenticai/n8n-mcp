@@ -132,3 +132,8 @@ export interface TelemetryErrorContext {
   timestamp: number;
   retryable: boolean;
 }
+
+/**
+ * Re-export workflow mutation types
+ */
+export type { WorkflowMutationRecord, WorkflowMutationData } from './mutation-types.js';
