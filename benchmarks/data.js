@@ -1,39 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1763548441198,
+  "lastUpdate": 1763662852595,
   "repoUrl": "https://github.com/czlonkowski/n8n-mcp",
   "entries": {
     "n8n-mcp Benchmarks": [
-      {
-        "commit": {
-          "author": {
-            "email": "56956555+czlonkowski@users.noreply.github.com",
-            "name": "Romuald Członkowski",
-            "username": "czlonkowski"
-          },
-          "committer": {
-            "email": "noreply@github.com",
-            "name": "GitHub",
-            "username": "web-flow"
-          },
-          "distinct": true,
-          "id": "4566253bdc2bc1bc734034c183b5249d4c96053e",
-          "message": "Merge pull request #310 from czlonkowski/fix/npm-publish-library-fields\n\nfix: Add library export fields to npm package (main, types, exports)",
-          "timestamp": "2025-10-12T00:19:26+02:00",
-          "tree_id": "1a3dae74ae5010ff5e212b1f629bacc30466b6f7",
-          "url": "https://github.com/czlonkowski/n8n-mcp/commit/4566253bdc2bc1bc734034c183b5249d4c96053e"
-        },
-        "date": 1760221286694,
-        "tool": "customSmallerIsBetter",
-        "benches": [
-          {
-            "name": "sample - array sorting - small",
-            "value": 0.0136,
-            "range": "0.3096",
-            "unit": "ms",
-            "extra": "73341 ops/sec"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -1542,6 +1511,37 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/czlonkowski/n8n-mcp/commit/47d9f55dc55b600b953d885bad2dba729f5baecc"
         },
         "date": 1763548440457,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "sample - array sorting - small",
+            "value": 0.0136,
+            "range": "0.3096",
+            "unit": "ms",
+            "extra": "73341 ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "56956555+czlonkowski@users.noreply.github.com",
+            "name": "Romuald Członkowski",
+            "username": "czlonkowski"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "fc37907348692bf46ff60286354677a59bfa98f8",
+          "message": "fix: resolve empty settings validation error in workflow updates (#431) (#432)",
+          "timestamp": "2025-11-20T19:19:08+01:00",
+          "tree_id": "f8f8f5774ac636412fd1d434c4671e173586056b",
+          "url": "https://github.com/czlonkowski/n8n-mcp/commit/fc37907348692bf46ff60286354677a59bfa98f8"
+        },
+        "date": 1763662852189,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
