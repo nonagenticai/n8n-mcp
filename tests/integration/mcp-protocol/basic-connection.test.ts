@@ -4,72 +4,71 @@ import { N8NDocumentationMCPServer } from '../../../src/mcp/server';
 describe('Basic MCP Connection', () => {
   it('should initialize MCP server', async () => {
     const server = new N8NDocumentationMCPServer();
-    
-    // Test executeTool directly - it returns raw data
-    const result = await server.executeTool('get_database_statistics', {});
+
+    // Test executeTool directly - tools_documentation returns a string
+    const result = await server.executeTool('tools_documentation', {});
     expect(result).toBeDefined();
-    expect(typeof result).toBe('object');
-    expect(result.totalNodes).toBeDefined();
-    expect(result.statistics).toBeDefined();
-    
+    expect(typeof result).toBe('string');
+    expect(result).toContain('n8n MCP');
+
     await server.shutdown();
   });
-  
-  it('should execute list_nodes tool', async () => {
+
+  it('should execute search_nodes tool', async () => {
     const server = new N8NDocumentationMCPServer();
-    
-    // First check if we have any nodes in the database
-    const stats = await server.executeTool('get_database_statistics', {});
-    const hasNodes = stats.totalNodes > 0;
-    
-    const result = await server.executeTool('list_nodes', { limit: 5 });
-    expect(result).toBeDefined();
-    expect(typeof result).toBe('object');
-    expect(result.nodes).toBeDefined();
-    expect(Array.isArray(result.nodes)).toBe(true);
-    
-    if (hasNodes) {
-      // If database has nodes, we should get up to 5
-      expect(result.nodes.length).toBeLessThanOrEqual(5);
-      expect(result.nodes.length).toBeGreaterThan(0);
-      expect(result.nodes[0]).toHaveProperty('nodeType');
-      expect(result.nodes[0]).toHaveProperty('displayName');
-    } else {
-      // In test environment with empty database, we expect empty results
-      expect(result.nodes).toHaveLength(0);
+
+    try {
+      // Search for a common node to verify database has content
+      const result = await server.executeTool('search_nodes', { query: 'http', limit: 5 });
+      expect(result).toBeDefined();
+      expect(typeof result).toBe('object');
+      expect(result.results).toBeDefined();
+      expect(Array.isArray(result.results)).toBe(true);
+
+      if (result.totalCount > 0) {
+        // If database has nodes, we should get results
+        expect(result.results.length).toBeLessThanOrEqual(5);
+        expect(result.results.length).toBeGreaterThan(0);
+        expect(result.results[0]).toHaveProperty('nodeType');
+        expect(result.results[0]).toHaveProperty('displayName');
+      }
+    } catch (error: any) {
+      // In test environment with empty database, expect appropriate error
+      expect(error.message).toContain('Database is empty');
     }
-    
+
     await server.shutdown();
   });
-  
-  it('should search nodes', async () => {
+
+  it('should search nodes by keyword', async () => {
     const server = new N8NDocumentationMCPServer();
-    
-    // First check if we have any nodes in the database
-    const stats = await server.executeTool('get_database_statistics', {});
-    const hasNodes = stats.totalNodes > 0;
-    
-    const result = await server.executeTool('search_nodes', { query: 'webhook' });
-    expect(result).toBeDefined();
-    expect(typeof result).toBe('object');
-    expect(result.results).toBeDefined();
-    expect(Array.isArray(result.results)).toBe(true);
-    
-    // Only expect results if the database has nodes
-    if (hasNodes) {
-      expect(result.results.length).toBeGreaterThan(0);
-      expect(result.totalCount).toBeGreaterThan(0);
-      
-      // Should find webhook node
-      const webhookNode = result.results.find((n: any) => n.nodeType === 'nodes-base.webhook');
-      expect(webhookNode).toBeDefined();
-      expect(webhookNode.displayName).toContain('Webhook');
-    } else {
-      // In test environment with empty database, we expect empty results
-      expect(result.results).toHaveLength(0);
-      expect(result.totalCount).toBe(0);
+
+    try {
+      // Search to check if database has nodes
+      const searchResult = await server.executeTool('search_nodes', { query: 'set', limit: 1 });
+      const hasNodes = searchResult.totalCount > 0;
+
+      const result = await server.executeTool('search_nodes', { query: 'webhook' });
+      expect(result).toBeDefined();
+      expect(typeof result).toBe('object');
+      expect(result.results).toBeDefined();
+      expect(Array.isArray(result.results)).toBe(true);
+
+      // Only expect results if the database has nodes
+      if (hasNodes) {
+        expect(result.results.length).toBeGreaterThan(0);
+        expect(result.totalCount).toBeGreaterThan(0);
+
+        // Should find webhook node
+        const webhookNode = result.results.find((n: any) => n.nodeType === 'nodes-base.webhook');
+        expect(webhookNode).toBeDefined();
+        expect(webhookNode.displayName).toContain('Webhook');
+      }
+    } catch (error: any) {
+      // In test environment with empty database, expect appropriate error
+      expect(error.message).toContain('Database is empty');
     }
-    
+
     await server.shutdown();
   });
 });

@@ -114,7 +114,7 @@ export class TestableN8NMCPServer {
     // The MCP server initializes its database lazily
     // We can trigger initialization by calling executeTool
     try {
-      await this.mcpServer.executeTool('get_database_statistics', {});
+      await this.mcpServer.executeTool('tools_documentation', {});
     } catch (error) {
       // Ignore errors, we just want to trigger initialization
     }

@@ -23,13 +23,13 @@ describe('MCP Performance Tests', () => {
     
     await client.connect(clientTransport);
     
-    // Verify database is populated by checking statistics
-    const statsResponse = await client.callTool({ name: 'get_database_statistics', arguments: {} });
-    if ((statsResponse as any).content && (statsResponse as any).content[0]) {
-      const stats = JSON.parse((statsResponse as any).content[0].text);
+    // Verify database is populated by searching for a common node
+    const searchResponse = await client.callTool({ name: 'search_nodes', arguments: { query: 'http', limit: 1 } });
+    if ((searchResponse as any).content && (searchResponse as any).content[0]) {
+      const searchResult = JSON.parse((searchResponse as any).content[0].text);
       // Ensure database has nodes for testing
-      if (!stats.totalNodes || stats.totalNodes === 0) {
-        console.error('Database stats:', stats);
+      if (!searchResult.totalCount || searchResult.totalCount === 0) {
+        console.error('Search result:', searchResult);
         throw new Error('Test database not properly populated');
       }
     }
@@ -46,13 +46,13 @@ describe('MCP Performance Tests', () => {
       const start = performance.now();
 
       for (let i = 0; i < iterations; i++) {
-        await client.callTool({ name: 'get_database_statistics', arguments: {} });
+        await client.callTool({ name: 'tools_documentation', arguments: {} });
       }
 
       const duration = performance.now() - start;
       const avgTime = duration / iterations;
 
-      console.log(`Average response time for get_database_statistics: ${avgTime.toFixed(2)}ms`);
+      console.log(`Average response time for tools_documentation: ${avgTime.toFixed(2)}ms`);
       console.log(`Environment: ${process.env.CI ? 'CI' : 'Local'}`);
 
       // Environment-aware threshold (relaxed +20% for type safety overhead)
@@ -60,20 +60,20 @@ describe('MCP Performance Tests', () => {
       expect(avgTime).toBeLessThan(threshold);
     });
 
-    it('should handle list operations efficiently', async () => {
+    it('should handle search operations efficiently', async () => {
       const iterations = 50;
       const start = performance.now();
 
       for (let i = 0; i < iterations; i++) {
-        await client.callTool({ name: 'list_nodes', arguments: { limit: 10 } });
+        await client.callTool({ name: 'search_nodes', arguments: { query: 'http', limit: 10 } });
       }
 
       const duration = performance.now() - start;
       const avgTime = duration / iterations;
 
-      console.log(`Average response time for list_nodes: ${avgTime.toFixed(2)}ms`);
+      console.log(`Average response time for search_nodes: ${avgTime.toFixed(2)}ms`);
       console.log(`Environment: ${process.env.CI ? 'CI' : 'Local'}`);
-      
+
       // Environment-aware threshold
       const threshold = process.env.CI ? 40 : 20;
       expect(avgTime).toBeLessThan(threshold);
@@ -137,7 +137,7 @@ describe('MCP Performance Tests', () => {
       const promises = [];
       for (let i = 0; i < concurrentRequests; i++) {
         promises.push(
-          client.callTool({ name: 'list_nodes', arguments: { limit: 5 } })
+          client.callTool({ name: 'search_nodes', arguments: { query: 'http', limit: 5 } })
         );
       }
 
@@ -148,7 +148,7 @@ describe('MCP Performance Tests', () => {
 
       console.log(`Average time for ${concurrentRequests} concurrent requests: ${avgTime.toFixed(2)}ms`);
       console.log(`Environment: ${process.env.CI ? 'CI' : 'Local'}`);
-      
+
       // Concurrent requests should be more efficient than sequential
       const threshold = process.env.CI ? 25 : 10;
       expect(avgTime).toBeLessThan(threshold);
@@ -156,11 +156,11 @@ describe('MCP Performance Tests', () => {
 
     it('should handle mixed concurrent operations', async () => {
       const operations = [
-        { tool: 'list_nodes', params: { limit: 10 } },
-        { tool: 'search_nodes', params: { query: 'http' } },
-        { tool: 'get_database_statistics', params: {} },
-        { tool: 'list_ai_tools', params: {} },
-        { tool: 'list_tasks', params: {} }
+        { tool: 'search_nodes', params: { query: 'http', limit: 10 } },
+        { tool: 'search_nodes', params: { query: 'webhook' } },
+        { tool: 'tools_documentation', params: {} },
+        { tool: 'get_node', params: { nodeType: 'nodes-base.httpRequest' } },
+        { tool: 'get_node', params: { nodeType: 'nodes-base.webhook' } }
       ];
 
       const rounds = 10;
@@ -186,34 +186,35 @@ describe('MCP Performance Tests', () => {
   });
 
   describe('Large Data Performance', () => {
-    it('should handle large node lists efficiently', async () => {
+    it('should handle large search results efficiently', async () => {
       const start = performance.now();
 
-      const response = await client.callTool({ name: 'list_nodes', arguments: {
-        limit: 200 // Get many nodes
+      const response = await client.callTool({ name: 'search_nodes', arguments: {
+        query: 'n8n', // Broad query to get many results
+        limit: 200
       } });
 
       const duration = performance.now() - start;
 
-      console.log(`Time to list 200 nodes: ${duration.toFixed(2)}ms`);
-      
+      console.log(`Time to search 200 nodes: ${duration.toFixed(2)}ms`);
+
       // Environment-aware threshold
       const threshold = process.env.CI ? 200 : 100;
       expect(duration).toBeLessThan(threshold);
 
       // Check the response content
       expect(response).toBeDefined();
-      
-      let nodes;
+
+      let results;
       if (response.content && Array.isArray(response.content) && response.content[0]) {
         // MCP standard response format
         expect(response.content[0].type).toBe('text');
         expect(response.content[0].text).toBeDefined();
-        
+
         try {
           const parsed = JSON.parse(response.content[0].text);
-          // list_nodes returns an object with nodes property
-          nodes = parsed.nodes || parsed;
+          // search_nodes returns an object with results property
+          results = parsed.results || parsed;
         } catch (e) {
           console.error('Failed to parse JSON:', e);
           console.error('Response text was:', response.content[0].text);
@@ -221,18 +222,18 @@ describe('MCP Performance Tests', () => {
         }
       } else if (Array.isArray(response)) {
         // Direct array response
-        nodes = response;
-      } else if (response.nodes) {
-        // Object with nodes property
-        nodes = response.nodes;
+        results = response;
+      } else if (response.results) {
+        // Object with results property
+        results = response.results;
       } else {
         console.error('Unexpected response format:', response);
         throw new Error('Unexpected response format');
       }
-      
-      expect(nodes).toBeDefined();
-      expect(Array.isArray(nodes)).toBe(true);
-      expect(nodes.length).toBeGreaterThan(100);
+
+      expect(results).toBeDefined();
+      expect(Array.isArray(results)).toBe(true);
+      expect(results.length).toBeGreaterThan(50);
     });
 
     it('should handle large workflow validation efficiently', async () => {
@@ -301,10 +302,10 @@ describe('MCP Performance Tests', () => {
 
       for (let i = 0; i < iterations; i += batchSize) {
         const promises = [];
-        
+
         for (let j = 0; j < batchSize; j++) {
           promises.push(
-            client.callTool({ name: 'get_database_statistics', arguments: {} })
+            client.callTool({ name: 'tools_documentation', arguments: {} })
           );
         }
 
@@ -330,9 +331,9 @@ describe('MCP Performance Tests', () => {
 
       // Perform large operations
       for (let i = 0; i < 10; i++) {
-        await client.callTool({ name: 'list_nodes', arguments: { limit: 200 } });
-        await client.callTool({ name: 'get_node', arguments: { 
-          nodeType: 'nodes-base.httpRequest' 
+        await client.callTool({ name: 'search_nodes', arguments: { query: 'n8n', limit: 200 } });
+        await client.callTool({ name: 'get_node', arguments: {
+          nodeType: 'nodes-base.httpRequest'
         } });
       }
 
@@ -359,16 +360,16 @@ describe('MCP Performance Tests', () => {
 
       for (const load of loadLevels) {
         const start = performance.now();
-        
+
         const promises = [];
         for (let i = 0; i < load; i++) {
           promises.push(
-            client.callTool({ name: 'list_nodes', arguments: { limit: 1 } })
+            client.callTool({ name: 'search_nodes', arguments: { query: 'http', limit: 1 } })
           );
         }
 
         await Promise.all(promises);
-        
+
         const duration = performance.now() - start;
         const avgTime = duration / load;
 
@@ -384,10 +385,10 @@ describe('MCP Performance Tests', () => {
       // Average time should not increase dramatically with load
       const firstAvg = results[0].avgTime;
       const lastAvg = results[results.length - 1].avgTime;
-      
+
       console.log(`Environment: ${process.env.CI ? 'CI' : 'Local'}`);
       console.log(`Performance scaling - First avg: ${firstAvg.toFixed(2)}ms, Last avg: ${lastAvg.toFixed(2)}ms`);
-      
+
       // Environment-aware scaling factor
       const scalingFactor = process.env.CI ? 3 : 2;
       expect(lastAvg).toBeLessThan(firstAvg * scalingFactor);
@@ -403,16 +404,16 @@ describe('MCP Performance Tests', () => {
         const operation = i % 4;
         switch (operation) {
           case 0:
-            promises.push(client.callTool({ name: 'list_nodes', arguments: { limit: 5 } }));
+            promises.push(client.callTool({ name: 'search_nodes', arguments: { query: 'http', limit: 5 } }));
             break;
           case 1:
             promises.push(client.callTool({ name: 'search_nodes', arguments: { query: 'test' } }));
             break;
           case 2:
-            promises.push(client.callTool({ name: 'get_database_statistics', arguments: {} }));
+            promises.push(client.callTool({ name: 'tools_documentation', arguments: {} }));
             break;
           case 3:
-            promises.push(client.callTool({ name: 'list_ai_tools', arguments: {} }));
+            promises.push(client.callTool({ name: 'get_node', arguments: { nodeType: 'nodes-base.set' } }));
             break;
         }
       }
@@ -431,10 +432,10 @@ describe('MCP Performance Tests', () => {
   });
 
   describe('Critical Path Optimization', () => {
-    it('should optimize tool listing performance', async () => {
+    it('should optimize search performance', async () => {
       // Warm up with multiple calls to ensure everything is initialized
       for (let i = 0; i < 5; i++) {
-        await client.callTool({ name: 'list_nodes', arguments: { limit: 1 } });
+        await client.callTool({ name: 'search_nodes', arguments: { query: 'http', limit: 1 } });
       }
 
       const iterations = 100;
@@ -442,32 +443,32 @@ describe('MCP Performance Tests', () => {
 
       for (let i = 0; i < iterations; i++) {
         const start = performance.now();
-        await client.callTool({ name: 'list_nodes', arguments: { limit: 20 } });
+        await client.callTool({ name: 'search_nodes', arguments: { query: 'http', limit: 20 } });
         times.push(performance.now() - start);
       }
 
       // Remove outliers (first few runs might be slower)
       times.sort((a, b) => a - b);
       const trimmedTimes = times.slice(10, -10); // Remove top and bottom 10%
-      
+
       const avgTime = trimmedTimes.reduce((a, b) => a + b, 0) / trimmedTimes.length;
       const minTime = Math.min(...trimmedTimes);
       const maxTime = Math.max(...trimmedTimes);
 
-      console.log(`list_nodes performance - Avg: ${avgTime.toFixed(2)}ms, Min: ${minTime.toFixed(2)}ms, Max: ${maxTime.toFixed(2)}ms`);
+      console.log(`search_nodes performance - Avg: ${avgTime.toFixed(2)}ms, Min: ${minTime.toFixed(2)}ms, Max: ${maxTime.toFixed(2)}ms`);
       console.log(`Environment: ${process.env.CI ? 'CI' : 'Local'}`);
 
       // Environment-aware thresholds
       const threshold = process.env.CI ? 25 : 10;
       expect(avgTime).toBeLessThan(threshold);
-      
+
       // Max should not be too much higher than average (no outliers)
       // More lenient in CI due to resource contention
       const maxMultiplier = process.env.CI ? 5 : 3;
       expect(maxTime).toBeLessThan(avgTime * maxMultiplier);
     });
 
-    it('should optimize search performance', async () => {
+    it('should handle varied search queries efficiently', async () => {
       // Warm up with multiple calls
       for (let i = 0; i < 3; i++) {
         await client.callTool({ name: 'search_nodes', arguments: { query: 'test' } });
@@ -487,7 +488,7 @@ describe('MCP Performance Tests', () => {
       // Remove outliers
       times.sort((a, b) => a - b);
       const trimmedTimes = times.slice(10, -10); // Remove top and bottom 10%
-      
+
       const avgTime = trimmedTimes.reduce((a, b) => a + b, 0) / trimmedTimes.length;
 
       console.log(`search_nodes average performance: ${avgTime.toFixed(2)}ms`);
@@ -542,7 +543,7 @@ describe('MCP Performance Tests', () => {
 
       while (performance.now() - start < duration) {
         try {
-          await client.callTool({ name: 'get_database_statistics', arguments: {} });
+          await client.callTool({ name: 'tools_documentation', arguments: {} });
           requestCount++;
         } catch (error) {
           errorCount++;
@@ -559,7 +560,7 @@ describe('MCP Performance Tests', () => {
       // Relaxed to 75 RPS locally to account for parallel test execution overhead
       const rpsThreshold = process.env.CI ? 50 : 75;
       expect(requestsPerSecond).toBeGreaterThan(rpsThreshold);
-      
+
       // Error rate should be very low
       expect(errorCount).toBe(0);
     });
@@ -591,7 +592,7 @@ describe('MCP Performance Tests', () => {
       const recoveryTimes: number[] = [];
       for (let i = 0; i < 10; i++) {
         const start = performance.now();
-        await client.callTool({ name: 'get_database_statistics', arguments: {} });
+        await client.callTool({ name: 'tools_documentation', arguments: {} });
         recoveryTimes.push(performance.now() - start);
       }
 

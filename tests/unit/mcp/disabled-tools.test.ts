@@ -73,14 +73,14 @@ describe('Disabled Tools Feature (Issue #410)', () => {
     });
 
     it('should parse multiple disabled tools correctly', () => {
-      process.env.DISABLED_TOOLS = 'n8n_diagnostic,n8n_health_check,list_nodes';
+      process.env.DISABLED_TOOLS = 'n8n_diagnostic,n8n_health_check,search_nodes';
       server = new TestableN8NMCPServer();
       const disabledTools = server.testGetDisabledTools();
 
       expect(disabledTools.size).toBe(3);
       expect(disabledTools.has('n8n_diagnostic')).toBe(true);
       expect(disabledTools.has('n8n_health_check')).toBe(true);
-      expect(disabledTools.has('list_nodes')).toBe(true);
+      expect(disabledTools.has('search_nodes')).toBe(true);
     });
 
     it('should trim whitespace from tool names', () => {
@@ -94,14 +94,14 @@ describe('Disabled Tools Feature (Issue #410)', () => {
     });
 
     it('should filter out empty entries from comma-separated list', () => {
-      process.env.DISABLED_TOOLS = 'n8n_diagnostic,,n8n_health_check,,,list_nodes';
+      process.env.DISABLED_TOOLS = 'n8n_diagnostic,,n8n_health_check,,,search_nodes';
       server = new TestableN8NMCPServer();
       const disabledTools = server.testGetDisabledTools();
 
       expect(disabledTools.size).toBe(3);
       expect(disabledTools.has('n8n_diagnostic')).toBe(true);
       expect(disabledTools.has('n8n_health_check')).toBe(true);
-      expect(disabledTools.has('list_nodes')).toBe(true);
+      expect(disabledTools.has('search_nodes')).toBe(true);
     });
 
     it('should handle single comma correctly', () => {

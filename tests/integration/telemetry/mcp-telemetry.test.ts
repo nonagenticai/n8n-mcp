@@ -500,15 +500,15 @@ describe.skip('MCP Telemetry Integration', () => {
       const slowToolRequest: CallToolRequest = {
         method: 'tools/call',
         params: {
-          name: 'list_nodes',
-          arguments: { limit: 1000 }
+          name: 'search_nodes',
+          arguments: { query: 'http', limit: 1000 }
         }
       };
 
       // Mock a slow operation
       vi.spyOn(mcpServer as any, 'executeTool').mockImplementation(async () => {
         await new Promise(resolve => setTimeout(resolve, 2000)); // 2 second delay
-        return { nodes: [], totalCount: 0 };
+        return { results: [], totalCount: 0 };
       });
 
       const server = (mcpServer as any).server;
@@ -519,7 +519,7 @@ describe.skip('MCP Telemetry Integration', () => {
       }
 
       expect(telemetry.trackToolUsage).toHaveBeenCalledWith(
-        'list_nodes',
+        'search_nodes',
         true,
         expect.any(Number)
       );
