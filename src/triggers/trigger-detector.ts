@@ -119,7 +119,7 @@ function detectWebhookTrigger(node: WorkflowNode): DetectedTrigger | null {
 
   // Extract webhook path from parameters
   const params = node.parameters || {};
-  const webhookPath = extractWebhookPath(params, node.id);
+  const webhookPath = extractWebhookPath(params, node.id, node.webhookId);
   const httpMethod = extractHttpMethod(params);
 
   return {
@@ -148,10 +148,12 @@ function detectFormTrigger(node: WorkflowNode): DetectedTrigger | null {
   // Extract form fields from parameters
   const params = node.parameters || {};
   const formFields = extractFormFields(params);
+  const webhookPath = extractWebhookPath(params, node.id, node.webhookId);
 
   return {
     type: 'form',
     node,
+    webhookPath,
     formFields,
   };
 }
@@ -174,7 +176,7 @@ function detectChatTrigger(node: WorkflowNode): DetectedTrigger | null {
   // Extract chat configuration
   const params = node.parameters || {};
   const responseMode = (params.options as any)?.responseMode || 'lastNode';
-  const webhookPath = extractWebhookPath(params, node.id);
+  const webhookPath = extractWebhookPath(params, node.id, node.webhookId);
 
   return {
     type: 'chat',
@@ -188,8 +190,14 @@ function detectChatTrigger(node: WorkflowNode): DetectedTrigger | null {
 
 /**
  * Extract webhook path from node parameters
+ *
+ * Priority:
+ * 1. Explicit path parameter in node config
+ * 2. HTTP method specific path
+ * 3. webhookId on the node (n8n assigns this for all webhook-like triggers)
+ * 4. Fallback to node ID
  */
-function extractWebhookPath(params: Record<string, unknown>, nodeId: string): string {
+function extractWebhookPath(params: Record<string, unknown>, nodeId: string, webhookId?: string): string {
   // Check for explicit path parameter
   if (typeof params.path === 'string' && params.path) {
     return params.path;
@@ -201,6 +209,11 @@ function extractWebhookPath(params: Record<string, unknown>, nodeId: string): st
     if (typeof methodPath === 'string' && methodPath) {
       return methodPath;
     }
+  }
+
+  // Use webhookId if available (n8n assigns this for chat/form/webhook triggers)
+  if (typeof webhookId === 'string' && webhookId) {
+    return webhookId;
   }
 
   // Default: use node ID as path (n8n default behavior)
@@ -262,17 +275,24 @@ export function buildTriggerUrl(
   const cleanBaseUrl = baseUrl.replace(/\/+$/, ''); // Remove trailing slashes
 
   switch (trigger.type) {
-    case 'webhook':
-    case 'chat': {
+    case 'webhook': {
       const prefix = mode === 'test' ? 'webhook-test' : 'webhook';
       const path = trigger.webhookPath || trigger.node.id;
       return `${cleanBaseUrl}/${prefix}/${path}`;
     }
 
+    case 'chat': {
+      // Chat triggers use /webhook/<webhookId>/chat endpoint
+      const prefix = mode === 'test' ? 'webhook-test' : 'webhook';
+      const path = trigger.webhookPath || trigger.node.id;
+      return `${cleanBaseUrl}/${prefix}/${path}/chat`;
+    }
+
     case 'form': {
-      // Form triggers use /form/<workflowId> endpoint
+      // Form triggers use /form/<webhookId> endpoint
       const prefix = mode === 'test' ? 'form-test' : 'form';
-      return `${cleanBaseUrl}/${prefix}/${trigger.node.id}`;
+      const path = trigger.webhookPath || trigger.node.id;
+      return `${cleanBaseUrl}/${prefix}/${path}`;
     }
 
     default:

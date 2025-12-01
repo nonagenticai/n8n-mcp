@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.28.2] - 2025-12-01
+
+### Bug Fixes
+
+**n8n_test_workflow: webhookId Resolution**
+
+Fixed critical bug where trigger handlers used `node.id` instead of `node.webhookId` for building webhook URLs. This caused chat/form/webhook triggers to fail with 404 errors when nodes had custom IDs.
+
+- **Root Cause**: `extractWebhookPath()` in `trigger-detector.ts` fell back to `node.id` instead of checking `node.webhookId` first
+- **Fix**: Added `webhookId` to `WorkflowNode` type and updated priority: `params.path` > `webhookId` > `node.id`
+- **Files**: `src/triggers/trigger-detector.ts`, `src/types/n8n-api.ts`
+
+**n8n_test_workflow: Chat Trigger URL Pattern**
+
+Fixed chat triggers using wrong URL pattern. n8n chat triggers require `/webhook/<id>/chat` suffix.
+
+- **Root Cause**: `buildTriggerUrl()` used same pattern for webhooks and chat triggers
+- **Fix**: Chat triggers now correctly use `/webhook/<webhookId>/chat` endpoint
+- **Files**: `src/triggers/trigger-detector.ts:284-289`
+
+**n8n_test_workflow: Form Trigger Content-Type**
+
+Fixed form triggers failing with "Expected multipart/form-data" error.
+
+- **Root Cause**: Form handler sent `application/json` but n8n requires `multipart/form-data`
+- **Fix**: Switched to `form-data` library for proper multipart encoding
+- **Files**: `src/triggers/handlers/form-handler.ts`
+
+### Enhancements
+
+**Form Handler: Complete Field Type Support**
+
+Enhanced form handler to support all n8n form field types with intelligent handling:
+
+- **Supported Types**: text, textarea, email, number, password, date, dropdown, checkbox, file, hidden, html
+- **Checkbox Arrays**: Automatically converts arrays to `field[]` format required by n8n
+- **File Uploads**: Supports base64 content or sends empty placeholder for required files
+- **Helpful Warnings**: Reports missing required fields with field names and labels
+- **Error Hints**: On failure, provides complete field structure with usage examples
+
+```javascript
+// Example with all field types
+n8n_test_workflow({
+  workflowId: "abc123",
+  data: {
+    "field-0": "text value",
+    "field-1": ["checkbox1", "checkbox2"],  // Array for checkboxes
+    "field-2": "dropdown_option",
+    "field-3": "2025-01-15",                // Date format
+    "field-4": "user@example.com",
+    "field-5": 42,                          // Number
+    "field-6": "password123"
+  }
+})
+```
+
+**Conceived by Romuald Członkowski - [AiAdvisors](https://www.aiadvisors.pl/en)**
+
 ## [2.28.1] - 2025-12-01
 
 ### 🐛 Bug Fixes

@@ -30,6 +30,7 @@ export interface WorkflowNode {
   waitBetweenTries?: number;
   alwaysOutputData?: boolean;
   executeOnce?: boolean;
+  webhookId?: string; // n8n assigns this for webhook/form/chat trigger nodes
 }
 
 export interface WorkflowConnection {

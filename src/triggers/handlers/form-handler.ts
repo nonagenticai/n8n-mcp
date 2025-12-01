@@ -2,14 +2,15 @@
  * Form trigger handler
  *
  * Handles form-based workflow triggers:
- * - POST to /form/<workflowId> or /form-test/<workflowId>
- * - Passes form fields as request body
+ * - POST to /form/<webhookId> with multipart/form-data
+ * - Supports all n8n form field types: text, textarea, email, number, password, date, dropdown, checkbox, file, hidden
  * - Workflow must be active (for production endpoint)
  */
 
 import { z } from 'zod';
 import axios, { AxiosRequestConfig } from 'axios';
-import { Workflow, WebhookRequest } from '../../types/n8n-api';
+import FormData from 'form-data';
+import { Workflow, WorkflowNode } from '../../types/n8n-api';
 import {
   TriggerType,
   TriggerResponse,
@@ -33,6 +34,123 @@ const formInputSchema = z.object({
 });
 
 /**
+ * Form field definition extracted from workflow
+ */
+interface FormFieldDef {
+  index: number;
+  fieldName: string;        // field-0, field-1, etc.
+  label: string;
+  type: string;
+  required: boolean;
+  options?: string[];       // For dropdown/checkbox
+}
+
+/**
+ * Extract form field definitions from workflow
+ */
+function extractFormFields(workflow: Workflow, triggerNode?: WorkflowNode): FormFieldDef[] {
+  const node = triggerNode || workflow.nodes.find(n =>
+    n.type.toLowerCase().includes('formtrigger')
+  );
+
+  const params = node?.parameters as Record<string, unknown> | undefined;
+  const formFields = params?.formFields as { values?: unknown[] } | undefined;
+
+  if (!formFields?.values) {
+    return [];
+  }
+
+  const fields: FormFieldDef[] = [];
+  let fieldIndex = 0;
+
+  for (const field of formFields.values as any[]) {
+    const fieldType = field.fieldType || 'text';
+
+    // HTML fields are rendered as hidden inputs but are display-only
+    // They still get a field index
+    const def: FormFieldDef = {
+      index: fieldIndex,
+      fieldName: `field-${fieldIndex}`,
+      label: field.fieldLabel || field.fieldName || field.elementName || `field-${fieldIndex}`,
+      type: fieldType,
+      required: field.requiredField === true,
+    };
+
+    // Extract options for dropdown/checkbox
+    if (field.fieldOptions?.values) {
+      def.options = field.fieldOptions.values.map((v: any) => v.option);
+    }
+
+    fields.push(def);
+    fieldIndex++;
+  }
+
+  return fields;
+}
+
+/**
+ * Generate helpful usage hint for form fields
+ */
+function generateFormUsageHint(fields: FormFieldDef[]): string {
+  if (fields.length === 0) {
+    return 'No form fields detected in workflow.';
+  }
+
+  const lines: string[] = ['Form fields (use these keys in data parameter):'];
+
+  for (const field of fields) {
+    let hint = `  "${field.fieldName}": `;
+
+    switch (field.type) {
+      case 'checkbox':
+        hint += `["${field.options?.[0] || 'option1'}", ...]`;
+        if (field.options) {
+          hint += ` (options: ${field.options.join(', ')})`;
+        }
+        break;
+      case 'dropdown':
+        hint += `"${field.options?.[0] || 'value'}"`;
+        if (field.options) {
+          hint += ` (options: ${field.options.join(', ')})`;
+        }
+        break;
+      case 'date':
+        hint += '"YYYY-MM-DD"';
+        break;
+      case 'email':
+        hint += '"user@example.com"';
+        break;
+      case 'number':
+        hint += '123';
+        break;
+      case 'file':
+        hint += '{ filename: "test.txt", content: "base64..." } or skip (sends empty file)';
+        break;
+      case 'password':
+        hint += '"secret"';
+        break;
+      case 'textarea':
+        hint += '"multi-line text..."';
+        break;
+      case 'html':
+        hint += '"" (display-only, can be omitted)';
+        break;
+      case 'hiddenField':
+        hint += '"value" (hidden field)';
+        break;
+      default:
+        hint += '"text value"';
+    }
+
+    hint += field.required ? ' [REQUIRED]' : '';
+    hint += ` // ${field.label}`;
+    lines.push(hint);
+  }
+
+  return lines.join('\n');
+}
+
+/**
  * Form trigger handler
  */
 export class FormHandler extends BaseTriggerHandler<FormTriggerInput> {
@@ -52,20 +170,27 @@ export class FormHandler extends BaseTriggerHandler<FormTriggerInput> {
   ): Promise<TriggerResponse> {
     const startTime = Date.now();
 
+    // Extract form field definitions for helpful error messages
+    const formFieldDefs = extractFormFields(workflow, triggerInfo?.node);
+
     try {
       // Build form URL
       const baseUrl = this.getBaseUrl();
       if (!baseUrl) {
-        return this.errorResponse(input, 'Cannot determine n8n base URL', startTime);
+        return this.errorResponse(input, 'Cannot determine n8n base URL', startTime, {
+          details: {
+            formFields: formFieldDefs,
+            hint: generateFormUsageHint(formFieldDefs),
+          },
+        });
       }
 
-      // Form triggers use /form/<path> endpoint
-      // The path can be from trigger info or workflow ID
-      const formPath = triggerInfo?.node?.parameters?.path || input.workflowId;
+      // Form triggers use /form/<webhookId> endpoint
+      const formPath = triggerInfo?.webhookPath || triggerInfo?.node?.parameters?.path || input.workflowId;
       const formUrl = `${baseUrl.replace(/\/+$/, '')}/form/${formPath}`;
 
       // Merge formData and data (formData takes precedence)
-      const formFields = {
+      const inputFields = {
         ...input.data,
         ...input.formData,
       };
@@ -77,15 +202,104 @@ export class FormHandler extends BaseTriggerHandler<FormTriggerInput> {
         return this.errorResponse(input, `SSRF protection: ${validation.reason}`, startTime);
       }
 
+      // Build multipart/form-data (required by n8n form triggers)
+      const formData = new FormData();
+      const warnings: string[] = [];
+
+      // Process each defined form field
+      for (const fieldDef of formFieldDefs) {
+        const value = inputFields[fieldDef.fieldName];
+
+        switch (fieldDef.type) {
+          case 'checkbox':
+            // Checkbox fields need array syntax with [] suffix
+            if (Array.isArray(value)) {
+              for (const item of value) {
+                formData.append(`${fieldDef.fieldName}[]`, String(item ?? ''));
+              }
+            } else if (value !== undefined && value !== null) {
+              // Single value provided, wrap in array
+              formData.append(`${fieldDef.fieldName}[]`, String(value));
+            } else if (fieldDef.required) {
+              warnings.push(`Required checkbox field "${fieldDef.fieldName}" (${fieldDef.label}) not provided`);
+            }
+            break;
+
+          case 'file':
+            // File fields - handle file upload or send empty placeholder
+            if (value && typeof value === 'object' && 'content' in value) {
+              // File object with content (base64 or buffer)
+              const fileObj = value as { filename?: string; content: string | Buffer };
+              const buffer = typeof fileObj.content === 'string'
+                ? Buffer.from(fileObj.content, 'base64')
+                : fileObj.content;
+              formData.append(fieldDef.fieldName, buffer, {
+                filename: fileObj.filename || 'file.txt',
+                contentType: 'application/octet-stream',
+              });
+            } else if (value && typeof value === 'string') {
+              // String value - treat as base64 content
+              formData.append(fieldDef.fieldName, Buffer.from(value, 'base64'), {
+                filename: 'file.txt',
+                contentType: 'application/octet-stream',
+              });
+            } else {
+              // No file provided - send empty file as placeholder
+              formData.append(fieldDef.fieldName, Buffer.from(''), {
+                filename: 'empty.txt',
+                contentType: 'text/plain',
+              });
+              if (fieldDef.required) {
+                warnings.push(`Required file field "${fieldDef.fieldName}" (${fieldDef.label}) not provided - sending empty placeholder`);
+              }
+            }
+            break;
+
+          case 'html':
+            // HTML is display-only, but n8n renders it as hidden input
+            // Send empty string or provided value
+            formData.append(fieldDef.fieldName, String(value ?? ''));
+            break;
+
+          case 'hiddenField':
+            // Hidden fields
+            formData.append(fieldDef.fieldName, String(value ?? ''));
+            break;
+
+          default:
+            // Standard fields: text, textarea, email, number, password, date, dropdown
+            if (value !== undefined && value !== null) {
+              formData.append(fieldDef.fieldName, String(value));
+            } else if (fieldDef.required) {
+              warnings.push(`Required field "${fieldDef.fieldName}" (${fieldDef.label}) not provided`);
+            }
+            break;
+        }
+      }
+
+      // Also include any extra fields not in the form definition (for flexibility)
+      const definedFieldNames = new Set(formFieldDefs.map(f => f.fieldName));
+      for (const [key, value] of Object.entries(inputFields)) {
+        if (!definedFieldNames.has(key)) {
+          if (Array.isArray(value)) {
+            for (const item of value) {
+              formData.append(`${key}[]`, String(item ?? ''));
+            }
+          } else {
+            formData.append(key, String(value ?? ''));
+          }
+        }
+      }
+
       // Build request config
       const config: AxiosRequestConfig = {
         method: 'POST',
         url: formUrl,
         headers: {
-          'Content-Type': 'application/json',
+          ...formData.getHeaders(),
           ...input.headers,
         },
-        data: formFields,
+        data: formData,
         timeout: input.timeout || (input.waitForResponse !== false ? 120000 : 30000),
         validateStatus: (status) => status < 500,
       };
@@ -93,13 +307,29 @@ export class FormHandler extends BaseTriggerHandler<FormTriggerInput> {
       // Make the request
       const response = await axios.request(config);
 
-      return this.normalizeResponse(response.data, input, startTime, {
+      const result = this.normalizeResponse(response.data, input, startTime, {
         status: response.status,
         statusText: response.statusText,
         metadata: {
           duration: Date.now() - startTime,
         },
       });
+
+      // Add fields submitted count to details
+      result.details = {
+        ...result.details,
+        fieldsSubmitted: formFieldDefs.length,
+      };
+
+      // Add warnings if any
+      if (warnings.length > 0) {
+        result.details = {
+          ...result.details,
+          warnings,
+        };
+      }
+
+      return result;
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
 
@@ -110,7 +340,17 @@ export class FormHandler extends BaseTriggerHandler<FormTriggerInput> {
       return this.errorResponse(input, errorMessage, startTime, {
         executionId,
         code: (error as any)?.code,
-        details: errorDetails,
+        details: {
+          ...errorDetails,
+          formFields: formFieldDefs.map(f => ({
+            name: f.fieldName,
+            label: f.label,
+            type: f.type,
+            required: f.required,
+            options: f.options,
+          })),
+          hint: generateFormUsageHint(formFieldDefs),
+        },
       });
     }
   }
