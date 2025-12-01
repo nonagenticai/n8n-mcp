@@ -146,6 +146,7 @@
     "dotenv": "^16.5.0",
     "express": "^5.1.0",
     "express-rate-limit": "^7.1.5",
+    "form-data": "^4.0.5",
     "lru-cache": "^11.2.1",
     "n8n": "^1.121.2",
     "n8n-core": "^1.120.1",

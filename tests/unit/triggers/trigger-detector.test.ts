@@ -242,7 +242,7 @@ describe('Trigger Detector', () => {
       expect(url).toContain('/form/');
     });
 
-    it('should build chat URL correctly', () => {
+    it('should build chat URL correctly with /chat suffix', () => {
       const baseUrl = 'https://n8n.example.com';
       const trigger = {
         type: 'chat' as const,
@@ -259,7 +259,8 @@ describe('Trigger Detector', () => {
 
       const url = buildTriggerUrl(baseUrl, trigger, 'production');
 
-      expect(url).toBe('https://n8n.example.com/webhook/ai-chat');
+      // Chat triggers use /webhook/<webhookId>/chat endpoint
+      expect(url).toBe('https://n8n.example.com/webhook/ai-chat/chat');
     });
   });
 

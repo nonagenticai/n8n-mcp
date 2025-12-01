@@ -34,6 +34,49 @@ const formInputSchema = z.object({
 });
 
 /**
+ * Form field types supported by n8n
+ */
+const FORM_FIELD_TYPES = {
+  TEXT: 'text',
+  TEXTAREA: 'textarea',
+  EMAIL: 'email',
+  NUMBER: 'number',
+  PASSWORD: 'password',
+  DATE: 'date',
+  DROPDOWN: 'dropdown',
+  CHECKBOX: 'checkbox',
+  FILE: 'file',
+  HIDDEN: 'hiddenField',
+  HTML: 'html',
+} as const;
+
+/**
+ * Maximum file size for base64 uploads (10MB)
+ */
+const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024;
+
+/**
+ * n8n form field option structure
+ */
+interface FormFieldOption {
+  option: string;
+}
+
+/**
+ * n8n form field value structure from workflow parameters
+ */
+interface FormFieldValue {
+  fieldType?: string;
+  fieldLabel?: string;
+  fieldName?: string;
+  elementName?: string;
+  requiredField?: boolean;
+  fieldOptions?: {
+    values?: FormFieldOption[];
+  };
+}
+
+/**
  * Form field definition extracted from workflow
  */
 interface FormFieldDef {
@@ -43,6 +86,27 @@ interface FormFieldDef {
   type: string;
   required: boolean;
   options?: string[];       // For dropdown/checkbox
+}
+
+/**
+ * Check if a string is valid base64
+ */
+function isValidBase64(str: string): boolean {
+  if (!str || str.length === 0) {
+    return false;
+  }
+  // Check for valid base64 characters and proper padding
+  const base64Regex = /^[A-Za-z0-9+/]*={0,2}$/;
+  if (!base64Regex.test(str)) {
+    return false;
+  }
+  try {
+    // Verify round-trip encoding
+    const decoded = Buffer.from(str, 'base64');
+    return decoded.toString('base64') === str;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -63,8 +127,9 @@ function extractFormFields(workflow: Workflow, triggerNode?: WorkflowNode): Form
   const fields: FormFieldDef[] = [];
   let fieldIndex = 0;
 
-  for (const field of formFields.values as any[]) {
-    const fieldType = field.fieldType || 'text';
+  for (const rawField of formFields.values) {
+    const field = rawField as FormFieldValue;
+    const fieldType = field.fieldType || FORM_FIELD_TYPES.TEXT;
 
     // HTML fields are rendered as hidden inputs but are display-only
     // They still get a field index
@@ -78,7 +143,7 @@ function extractFormFields(workflow: Workflow, triggerNode?: WorkflowNode): Form
 
     // Extract options for dropdown/checkbox
     if (field.fieldOptions?.values) {
-      def.options = field.fieldOptions.values.map((v: any) => v.option);
+      def.options = field.fieldOptions.values.map((v: FormFieldOption) => v.option);
     }
 
     fields.push(def);
@@ -102,40 +167,40 @@ function generateFormUsageHint(fields: FormFieldDef[]): string {
     let hint = `  "${field.fieldName}": `;
 
     switch (field.type) {
-      case 'checkbox':
+      case FORM_FIELD_TYPES.CHECKBOX:
         hint += `["${field.options?.[0] || 'option1'}", ...]`;
         if (field.options) {
           hint += ` (options: ${field.options.join(', ')})`;
         }
         break;
-      case 'dropdown':
+      case FORM_FIELD_TYPES.DROPDOWN:
         hint += `"${field.options?.[0] || 'value'}"`;
         if (field.options) {
           hint += ` (options: ${field.options.join(', ')})`;
         }
         break;
-      case 'date':
+      case FORM_FIELD_TYPES.DATE:
         hint += '"YYYY-MM-DD"';
         break;
-      case 'email':
+      case FORM_FIELD_TYPES.EMAIL:
         hint += '"user@example.com"';
         break;
-      case 'number':
+      case FORM_FIELD_TYPES.NUMBER:
         hint += '123';
         break;
-      case 'file':
+      case FORM_FIELD_TYPES.FILE:
         hint += '{ filename: "test.txt", content: "base64..." } or skip (sends empty file)';
         break;
-      case 'password':
+      case FORM_FIELD_TYPES.PASSWORD:
         hint += '"secret"';
         break;
-      case 'textarea':
+      case FORM_FIELD_TYPES.TEXTAREA:
         hint += '"multi-line text..."';
         break;
-      case 'html':
+      case FORM_FIELD_TYPES.HTML:
         hint += '"" (display-only, can be omitted)';
         break;
-      case 'hiddenField':
+      case FORM_FIELD_TYPES.HIDDEN:
         hint += '"value" (hidden field)';
         break;
       default:
@@ -211,7 +276,7 @@ export class FormHandler extends BaseTriggerHandler<FormTriggerInput> {
         const value = inputFields[fieldDef.fieldName];
 
         switch (fieldDef.type) {
-          case 'checkbox':
+          case FORM_FIELD_TYPES.CHECKBOX:
             // Checkbox fields need array syntax with [] suffix
             if (Array.isArray(value)) {
               for (const item of value) {
@@ -225,24 +290,62 @@ export class FormHandler extends BaseTriggerHandler<FormTriggerInput> {
             }
             break;
 
-          case 'file':
+          case FORM_FIELD_TYPES.FILE:
             // File fields - handle file upload or send empty placeholder
             if (value && typeof value === 'object' && 'content' in value) {
               // File object with content (base64 or buffer)
               const fileObj = value as { filename?: string; content: string | Buffer };
-              const buffer = typeof fileObj.content === 'string'
-                ? Buffer.from(fileObj.content, 'base64')
-                : fileObj.content;
+              let buffer: Buffer;
+
+              if (typeof fileObj.content === 'string') {
+                // Validate base64 encoding
+                if (!isValidBase64(fileObj.content)) {
+                  warnings.push(`Invalid base64 encoding for file field "${fieldDef.fieldName}" (${fieldDef.label})`);
+                  buffer = Buffer.from('');
+                } else {
+                  buffer = Buffer.from(fileObj.content, 'base64');
+                  // Check file size
+                  if (buffer.length > MAX_FILE_SIZE_BYTES) {
+                    warnings.push(`File too large for "${fieldDef.fieldName}" (${fieldDef.label}): ${Math.round(buffer.length / 1024 / 1024)}MB exceeds ${MAX_FILE_SIZE_BYTES / 1024 / 1024}MB limit`);
+                    buffer = Buffer.from('');
+                  }
+                }
+              } else {
+                buffer = fileObj.content;
+                // Check file size for Buffer input
+                if (buffer.length > MAX_FILE_SIZE_BYTES) {
+                  warnings.push(`File too large for "${fieldDef.fieldName}" (${fieldDef.label}): ${Math.round(buffer.length / 1024 / 1024)}MB exceeds ${MAX_FILE_SIZE_BYTES / 1024 / 1024}MB limit`);
+                  buffer = Buffer.from('');
+                }
+              }
+
               formData.append(fieldDef.fieldName, buffer, {
                 filename: fileObj.filename || 'file.txt',
                 contentType: 'application/octet-stream',
               });
             } else if (value && typeof value === 'string') {
               // String value - treat as base64 content
-              formData.append(fieldDef.fieldName, Buffer.from(value, 'base64'), {
-                filename: 'file.txt',
-                contentType: 'application/octet-stream',
-              });
+              if (!isValidBase64(value)) {
+                warnings.push(`Invalid base64 encoding for file field "${fieldDef.fieldName}" (${fieldDef.label})`);
+                formData.append(fieldDef.fieldName, Buffer.from(''), {
+                  filename: 'empty.txt',
+                  contentType: 'text/plain',
+                });
+              } else {
+                const buffer = Buffer.from(value, 'base64');
+                if (buffer.length > MAX_FILE_SIZE_BYTES) {
+                  warnings.push(`File too large for "${fieldDef.fieldName}" (${fieldDef.label}): ${Math.round(buffer.length / 1024 / 1024)}MB exceeds ${MAX_FILE_SIZE_BYTES / 1024 / 1024}MB limit`);
+                  formData.append(fieldDef.fieldName, Buffer.from(''), {
+                    filename: 'empty.txt',
+                    contentType: 'text/plain',
+                  });
+                } else {
+                  formData.append(fieldDef.fieldName, buffer, {
+                    filename: 'file.txt',
+                    contentType: 'application/octet-stream',
+                  });
+                }
+              }
             } else {
               // No file provided - send empty file as placeholder
               formData.append(fieldDef.fieldName, Buffer.from(''), {
@@ -255,13 +358,13 @@ export class FormHandler extends BaseTriggerHandler<FormTriggerInput> {
             }
             break;
 
-          case 'html':
+          case FORM_FIELD_TYPES.HTML:
             // HTML is display-only, but n8n renders it as hidden input
             // Send empty string or provided value
             formData.append(fieldDef.fieldName, String(value ?? ''));
             break;
 
-          case 'hiddenField':
+          case FORM_FIELD_TYPES.HIDDEN:
             // Hidden fields
             formData.append(fieldDef.fieldName, String(value ?? ''));
             break;

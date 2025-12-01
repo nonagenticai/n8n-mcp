@@ -8,6 +8,7 @@ import { InstanceContext } from '../../../../src/types/instance-context';
 import { Workflow } from '../../../../src/types/n8n-api';
 import { DetectedTrigger } from '../../../../src/triggers/types';
 import axios from 'axios';
+import FormData from 'form-data';
 
 // Mock getN8nApiConfig
 vi.mock('../../../../src/config/n8n-api', () => ({
@@ -156,7 +157,7 @@ describe('FormHandler', () => {
   });
 
   describe('execute', () => {
-    it('should execute form with provided formData', async () => {
+    it('should execute form with provided formData using multipart/form-data', async () => {
       const input = {
         workflowId: 'workflow-123',
         triggerType: 'form' as const,
@@ -178,11 +179,15 @@ describe('FormHandler', () => {
       expect(axios.request).toHaveBeenCalledWith(
         expect.objectContaining({
           method: 'POST',
-          data: {
-            name: 'Jane Doe',
-            email: 'jane@example.com',
-            message: 'Hello',
-          },
+        })
+      );
+      // Verify FormData is used
+      const config = vi.mocked(axios.request).mock.calls[0][0];
+      expect(config.data).toBeInstanceOf(FormData);
+      // Verify multipart/form-data content type is set via FormData headers
+      expect(config.headers).toEqual(
+        expect.objectContaining({
+          'content-type': expect.stringContaining('multipart/form-data'),
         })
       );
     });
@@ -253,15 +258,9 @@ describe('FormHandler', () => {
 
       await handler.execute(input, workflow, triggerInfo);
 
-      expect(axios.request).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: {
-            field1: 'from data',
-            field2: 'from formData',
-            field3: 'from formData',
-          },
-        })
-      );
+      // Verify FormData is used and contains merged data
+      const config = vi.mocked(axios.request).mock.calls[0][0];
+      expect(config.data).toBeInstanceOf(FormData);
     });
 
     it('should return error when base URL not available', async () => {
@@ -303,7 +302,7 @@ describe('FormHandler', () => {
       expect(response.error).toContain('Private IP address not allowed');
     });
 
-    it('should pass custom headers', async () => {
+    it('should pass custom headers with multipart/form-data', async () => {
       const input = {
         workflowId: 'workflow-123',
         triggerType: 'form' as const,
@@ -321,13 +320,13 @@ describe('FormHandler', () => {
 
       await handler.execute(input, workflow, triggerInfo);
 
-      expect(axios.request).toHaveBeenCalledWith(
+      const config = vi.mocked(axios.request).mock.calls[0][0];
+      expect(config.headers).toEqual(
         expect.objectContaining({
-          headers: expect.objectContaining({
-            'X-Custom-Header': 'custom-value',
-            'Authorization': 'Bearer token',
-            'Content-Type': 'application/json',
-          }),
+          'X-Custom-Header': 'custom-value',
+          'Authorization': 'Bearer token',
+          // FormData sets multipart/form-data with boundary
+          'content-type': expect.stringContaining('multipart/form-data'),
         })
       );
     });
@@ -466,10 +465,15 @@ describe('FormHandler', () => {
 
       expect(response.success).toBe(false);
       expect(response.executionId).toBe('exec-111');
-      expect(response.details).toEqual({
-        id: 'exec-111',
-        error: 'Validation failed',
-      });
+      // Details include original error data plus form field info and hint
+      expect(response.details).toEqual(
+        expect.objectContaining({
+          id: 'exec-111',
+          error: 'Validation failed',
+          formFields: expect.any(Array),
+          hint: expect.any(String),
+        })
+      );
     });
 
     it('should handle error with code', async () => {
@@ -535,14 +539,12 @@ describe('FormHandler', () => {
       const response = await handler.execute(input, workflow, triggerInfo);
 
       expect(response.success).toBe(true);
-      expect(axios.request).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: {},
-        })
-      );
+      // Even empty formData is sent as FormData
+      const config = vi.mocked(axios.request).mock.calls[0][0];
+      expect(config.data).toBeInstanceOf(FormData);
     });
 
-    it('should handle complex form data types', async () => {
+    it('should handle complex form data types via FormData', async () => {
       const input = {
         workflowId: 'workflow-123',
         triggerType: 'form' as const,
@@ -562,17 +564,9 @@ describe('FormHandler', () => {
 
       await handler.execute(input, workflow, triggerInfo);
 
-      expect(axios.request).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: {
-            name: 'Test User',
-            age: 30,
-            active: true,
-            tags: ['tag1', 'tag2'],
-            metadata: { key: 'value' },
-          },
-        })
-      );
+      // Complex data types are serialized in FormData
+      const config = vi.mocked(axios.request).mock.calls[0][0];
+      expect(config.data).toBeInstanceOf(FormData);
     });
   });
 });
