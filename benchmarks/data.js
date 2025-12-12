@@ -1,39 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1765543862960,
+  "lastUpdate": 1765545538334,
   "repoUrl": "https://github.com/czlonkowski/n8n-mcp",
   "entries": {
     "n8n-mcp Benchmarks": [
-      {
-        "commit": {
-          "author": {
-            "email": "56956555+czlonkowski@users.noreply.github.com",
-            "name": "Romuald Członkowski",
-            "username": "czlonkowski"
-          },
-          "committer": {
-            "email": "noreply@github.com",
-            "name": "GitHub",
-            "username": "web-flow"
-          },
-          "distinct": true,
-          "id": "9a3520adb7017529ee23d8873d86daea3d6f2957",
-          "message": "Merge pull request #366 from czlonkowski/enhance/http-validation-suggestions-361\n\nenhance: Add HTTP Request node validation suggestions (issue #361)",
-          "timestamp": "2025-10-24T17:55:05+02:00",
-          "tree_id": "44ac2ef34ba56ff420ca332566f11033202a8e0d",
-          "url": "https://github.com/czlonkowski/n8n-mcp/commit/9a3520adb7017529ee23d8873d86daea3d6f2957"
-        },
-        "date": 1761321416009,
-        "tool": "customSmallerIsBetter",
-        "benches": [
-          {
-            "name": "sample - array sorting - small",
-            "value": 0.0136,
-            "range": "0.3096",
-            "unit": "ms",
-            "extra": "73341 ops/sec"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -1536,6 +1505,35 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/czlonkowski/n8n-mcp/commit/6e85c68d6259eb78b256f5ac4559ba3e665e0886"
         },
         "date": 1765543862564,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "sample - array sorting - small",
+            "value": 0.0136,
+            "range": "0.3096",
+            "unit": "ms",
+            "extra": "73341 ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "romualdczlonkowski@MacBook-Pro-Romuald.local",
+            "name": "Romuald Członkowski"
+          },
+          "committer": {
+            "email": "romualdczlonkowski@MacBook-Pro-Romuald.local",
+            "name": "Romuald Członkowski"
+          },
+          "distinct": true,
+          "id": "c6f3733fbd6de37b1514f5800cb8d43bded30eee",
+          "message": "fix: upgrade npm for OIDC trusted publishing support\n\nOIDC trusted publishing requires npm >= 11.5.1, but Node.js 20/22\nships with npm 10.x. Added explicit npm upgrade step before publish.\n\nAlso upgraded to Node.js 22 for better npm compatibility.\n\nConceived by Romuald Członkowski - www.aiadvisors.pl/en\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+          "timestamp": "2025-12-12T14:17:23+01:00",
+          "tree_id": "9ba01f9525d17511d27acffe82237b3ec98b5e23",
+          "url": "https://github.com/czlonkowski/n8n-mcp/commit/c6f3733fbd6de37b1514f5800cb8d43bded30eee"
+        },
+        "date": 1765545538067,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
