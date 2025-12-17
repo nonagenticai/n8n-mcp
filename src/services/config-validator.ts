@@ -192,7 +192,11 @@ export class ConfigValidator {
     if ('gt' in cnd) return configValue > cnd.gt;
     if ('lt' in cnd) return configValue < cnd.lt;
     if ('between' in cnd) {
-      return configValue >= cnd.between.from && configValue <= cnd.between.to;
+      const between = cnd.between;
+      if (!between || typeof between.from === 'undefined' || typeof between.to === 'undefined') {
+        return false; // Invalid between structure
+      }
+      return configValue >= between.from && configValue <= between.to;
     }
     if ('startsWith' in cnd) {
       return typeof configValue === 'string' && configValue.startsWith(cnd.startsWith);
@@ -204,7 +208,12 @@ export class ConfigValidator {
       return typeof configValue === 'string' && configValue.includes(cnd.includes);
     }
     if ('regex' in cnd) {
-      return typeof configValue === 'string' && new RegExp(cnd.regex).test(configValue);
+      if (typeof configValue !== 'string') return false;
+      try {
+        return new RegExp(cnd.regex).test(configValue);
+      } catch {
+        return false; // Invalid regex pattern
+      }
     }
     if ('exists' in cnd) {
       return configValue !== undefined && configValue !== null;

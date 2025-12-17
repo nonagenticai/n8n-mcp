@@ -216,6 +216,36 @@ describe('ConfigValidator _cnd operators', () => {
         };
         expect(ConfigValidator.isPropertyVisible(prop, { '@version': 5 })).toBe(false);
       });
+
+      it('should not match when between structure is null', () => {
+        const prop = {
+          name: 'testField',
+          displayOptions: {
+            show: { '@version': [{ _cnd: { between: null } }] }
+          }
+        };
+        expect(ConfigValidator.isPropertyVisible(prop, { '@version': 4 })).toBe(false);
+      });
+
+      it('should not match when between is missing from field', () => {
+        const prop = {
+          name: 'testField',
+          displayOptions: {
+            show: { '@version': [{ _cnd: { between: { to: 5 } } }] }
+          }
+        };
+        expect(ConfigValidator.isPropertyVisible(prop, { '@version': 4 })).toBe(false);
+      });
+
+      it('should not match when between is missing to field', () => {
+        const prop = {
+          name: 'testField',
+          displayOptions: {
+            show: { '@version': [{ _cnd: { between: { from: 3 } } }] }
+          }
+        };
+        expect(ConfigValidator.isPropertyVisible(prop, { '@version': 4 })).toBe(false);
+      });
     });
 
     describe('startsWith operator', () => {
@@ -313,6 +343,27 @@ describe('ConfigValidator _cnd operators', () => {
           }
         };
         expect(ConfigValidator.isPropertyVisible(prop, { id: 'abc1234' })).toBe(false);
+      });
+
+      it('should not match when regex pattern is invalid', () => {
+        const prop = {
+          name: 'testField',
+          displayOptions: {
+            show: { id: [{ _cnd: { regex: '[invalid(regex' } }] }
+          }
+        };
+        // Invalid regex should return false without throwing
+        expect(ConfigValidator.isPropertyVisible(prop, { id: 'test' })).toBe(false);
+      });
+
+      it('should not match non-string values', () => {
+        const prop = {
+          name: 'testField',
+          displayOptions: {
+            show: { value: [{ _cnd: { regex: '\\d+' } }] }
+          }
+        };
+        expect(ConfigValidator.isPropertyVisible(prop, { value: 123 })).toBe(false);
       });
     });
 

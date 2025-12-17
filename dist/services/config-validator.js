@@ -98,7 +98,11 @@ class ConfigValidator {
         if ('lt' in cnd)
             return configValue < cnd.lt;
         if ('between' in cnd) {
-            return configValue >= cnd.between.from && configValue <= cnd.between.to;
+            const between = cnd.between;
+            if (!between || typeof between.from === 'undefined' || typeof between.to === 'undefined') {
+                return false;
+            }
+            return configValue >= between.from && configValue <= between.to;
         }
         if ('startsWith' in cnd) {
             return typeof configValue === 'string' && configValue.startsWith(cnd.startsWith);
@@ -110,7 +114,14 @@ class ConfigValidator {
             return typeof configValue === 'string' && configValue.includes(cnd.includes);
         }
         if ('regex' in cnd) {
-            return typeof configValue === 'string' && new RegExp(cnd.regex).test(configValue);
+            if (typeof configValue !== 'string')
+                return false;
+            try {
+                return new RegExp(cnd.regex).test(configValue);
+            }
+            catch {
+                return false;
+            }
         }
         if ('exists' in cnd) {
             return configValue !== undefined && configValue !== null;
