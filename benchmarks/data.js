@@ -1,39 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1765993195926,
+  "lastUpdate": 1766322833421,
   "repoUrl": "https://github.com/czlonkowski/n8n-mcp",
   "entries": {
     "n8n-mcp Benchmarks": [
-      {
-        "commit": {
-          "author": {
-            "email": "56956555+czlonkowski@users.noreply.github.com",
-            "name": "Romuald Członkowski",
-            "username": "czlonkowski"
-          },
-          "committer": {
-            "email": "noreply@github.com",
-            "name": "GitHub",
-            "username": "web-flow"
-          },
-          "distinct": true,
-          "id": "b87f638e52d85ab77302f60293113d01d28a14ae",
-          "message": "Merge pull request #370 from czlonkowski/claude/version-bump-2.22.5-011CUTuNP2G3vGqSo8R9uubN\n\nchore: bump version to 2.22.5",
-          "timestamp": "2025-10-25T17:19:15+02:00",
-          "tree_id": "aad35ed51b6ec46de9a86a59e67c7189c02ba65d",
-          "url": "https://github.com/czlonkowski/n8n-mcp/commit/b87f638e52d85ab77302f60293113d01d28a14ae"
-        },
-        "date": 1761405669681,
-        "tool": "customSmallerIsBetter",
-        "benches": [
-          {
-            "name": "sample - array sorting - small",
-            "value": 0.0136,
-            "range": "0.3096",
-            "unit": "ms",
-            "extra": "73341 ops/sec"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -1532,6 +1501,37 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/czlonkowski/n8n-mcp/commit/562f4b0c4ecb98d3e9c8993ea4a911f64a5d7c40"
         },
         "date": 1765993195530,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "sample - array sorting - small",
+            "value": 0.0136,
+            "range": "0.3096",
+            "unit": "ms",
+            "extra": "73341 ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "56956555+czlonkowski@users.noreply.github.com",
+            "name": "Romuald Członkowski",
+            "username": "czlonkowski"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "fa216e4d1375dfec7e2de424ee0c05a3869db65c",
+          "message": "fix: restore templates database with 2,768 workflow templates (v2.30.2) (#502)\n\n- Restored templates from git history (commit 03a4b07)\n- Updated nodes schema with tool variant columns\n- Database now contains 803 nodes and 2,768 templates\n- Compatible with n8n 2.0.2\n\nConceived by Romuald Członkowski - https://www.aiadvisors.pl/en\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-authored-by: Romuald Członkowski <romualdczlonkowski@MacBook-Pro-Romuald.local>\nCo-authored-by: Claude Opus 4.5 <noreply@anthropic.com>",
+          "timestamp": "2025-12-21T14:11:57+01:00",
+          "tree_id": "acd674c606d60c4aff7260b253fb1d2d0c55d08a",
+          "url": "https://github.com/czlonkowski/n8n-mcp/commit/fa216e4d1375dfec7e2de424ee0c05a3869db65c"
+        },
+        "date": 1766322833175,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
