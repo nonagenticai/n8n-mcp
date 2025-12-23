@@ -1,39 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1766506581114,
+  "lastUpdate": 1766512367697,
   "repoUrl": "https://github.com/czlonkowski/n8n-mcp",
   "entries": {
     "n8n-mcp Benchmarks": [
-      {
-        "commit": {
-          "author": {
-            "email": "56956555+czlonkowski@users.noreply.github.com",
-            "name": "Romuald Członkowski",
-            "username": "czlonkowski"
-          },
-          "committer": {
-            "email": "noreply@github.com",
-            "name": "GitHub",
-            "username": "web-flow"
-          },
-          "distinct": true,
-          "id": "892c4ed70a40c22c74155fe3625257a6e4988221",
-          "message": "Resolve GitHub Issue 292 in n8n-mcp (#375)\n\n* docs: add comprehensive documentation for removing node properties with undefined\n\nAdd detailed documentation section for property removal pattern in n8n_update_partial_workflow tool:\n- New \"Removing Properties with undefined\" section explaining the pattern\n- Examples showing basic, nested, and batch property removal\n- Migration guide for deprecated properties (continueOnFail → onError)\n- Best practices for when to use undefined\n- Pitfalls to avoid (null vs undefined, mutual exclusivity, etc.)\n\nThis addresses the documentation gap reported in issue #292 where users\nwere confused about how to remove properties during node updates.\n\nConceived by Romuald Członkowski - https://www.aiadvisors.pl/en\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n\n* fix: correct array property removal documentation in n8n_update_partial_workflow (Issue #292)\n\nFixed critical documentation error showing array index notation [0] which doesn't work.\nThe setNestedProperty implementation treats \"headers[0]\" as a literal object key, not an array index.\n\nChanges:\n- Updated nested property removal section to show entire array removal\n- Corrected example rm5 to use \"parameters.headers\" instead of \"parameters.headers[0]\"\n- Replaced misleading pitfall with accurate warning about array index notation not being supported\n\nImpact:\n- Prevents user confusion and non-functional code\n- All examples now show correct, working patterns\n- Clear warning helps users avoid this mistake\n\nConceived by Romuald Członkowski - https://www.aiadvisors.pl/en\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude <noreply@anthropic.com>",
-          "timestamp": "2025-10-26T11:07:30+01:00",
-          "tree_id": "013b8088524cd46df3e8251f6fab3177df0abfda",
-          "url": "https://github.com/czlonkowski/n8n-mcp/commit/892c4ed70a40c22c74155fe3625257a6e4988221"
-        },
-        "date": 1761473384397,
-        "tool": "customSmallerIsBetter",
-        "benches": [
-          {
-            "name": "sample - array sorting - small",
-            "value": 0.0136,
-            "range": "0.3096",
-            "unit": "ms",
-            "extra": "73341 ops/sec"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -1530,6 +1499,37 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/czlonkowski/n8n-mcp/commit/d60182eeb8581320278e5f2205cc0378d49ff071"
         },
         "date": 1766506580808,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "sample - array sorting - small",
+            "value": 0.0136,
+            "range": "0.3096",
+            "unit": "ms",
+            "extra": "73341 ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "56956555+czlonkowski@users.noreply.github.com",
+            "name": "Romuald Członkowski",
+            "username": "czlonkowski"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "705d31c35e93f868b58add97f074500857368381",
+          "message": "fix: mcpTrigger nodes no longer flagged as disconnected (#503) (#506)\n\nFixed validation bug where mcpTrigger nodes were incorrectly flagged as\n\"disconnected nodes\" when using n8n_update_partial_workflow or\nn8n_update_full_workflow. This blocked ALL updates to MCP server workflows.\n\nChanges:\n- Extended validateWorkflowStructure() to check all 7 connection types\n  (main, error, ai_tool, ai_languageModel, ai_memory, ai_embedding, ai_vectorStore)\n- Updated trigger node validation to accept either outgoing OR inbound connections\n- Added 7 new tests covering all AI connection types\n\nFixes #503\n\nConceived by Romuald Członkowski - https://www.aiadvisors.pl/en\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-authored-by: Romuald Członkowski <romualdczlonkowski@MacBook-Pro-Romuald.local>\nCo-authored-by: Claude Opus 4.5 <noreply@anthropic.com>",
+          "timestamp": "2025-12-23T18:50:55+01:00",
+          "tree_id": "bbe4aa26da9600ff36b8951b04e6cf8434e3f51a",
+          "url": "https://github.com/czlonkowski/n8n-mcp/commit/705d31c35e93f868b58add97f074500857368381"
+        },
+        "date": 1766512366242,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
