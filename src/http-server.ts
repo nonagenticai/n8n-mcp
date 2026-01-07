@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * @deprecated This fixed HTTP server is deprecated as of v2.31.7.
+ * @deprecated This fixed HTTP server is deprecated as of v2.31.8.
  * Use SingleSessionHTTPServer from http-server-single-session.ts instead.
  *
  * This implementation does not support SSE streaming required by clients like OpenAI Codex.
@@ -139,7 +139,7 @@ async function shutdown() {
 export async function startFixedHTTPServer() {
   // Log deprecation warning
   logger.warn(
-    'DEPRECATION: startFixedHTTPServer() is deprecated as of v2.31.7. ' +
+    'DEPRECATION: startFixedHTTPServer() is deprecated as of v2.31.8. ' +
     'Use SingleSessionHTTPServer which supports SSE streaming. ' +
     'See: https://github.com/czlonkowski/n8n-mcp/issues/524'
   );

@@ -74,7 +74,7 @@ ENV AUTH_TOKEN="REPLACE_THIS_AUTH_TOKEN_32_CHARS_MIN_abcdefgh"
 ENV NODE_ENV=production
 ENV IS_DOCKER=true
 ENV MCP_MODE=http
-# NOTE: USE_FIXED_HTTP is deprecated and removed. SingleSessionHTTPServer is now the default.
+# NOTE: USE_FIXED_HTTP is deprecated. SingleSessionHTTPServer is now the default.
 # See: https://github.com/czlonkowski/n8n-mcp/issues/524
 ENV LOG_LEVEL=info
 ENV TRUST_PROXY=1
