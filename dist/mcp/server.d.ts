@@ -1,5 +1,15 @@
+import { NodeRepository } from '../database/node-repository';
+import { DatabaseAdapter } from '../database/database-adapter';
+import { SimpleCache } from '../utils/simple-cache';
+import { TemplateService } from '../templates/template-service';
 import { InstanceContext } from '../types/instance-context';
 import { EarlyErrorLogger } from '../telemetry/early-error-logger';
+export interface SharedResources {
+    db: DatabaseAdapter;
+    repository: NodeRepository;
+    templateService: TemplateService;
+    cache: SimpleCache;
+}
 export declare class N8NDocumentationMCPServer {
     private server;
     private db;
@@ -13,8 +23,10 @@ export declare class N8NDocumentationMCPServer {
     private previousToolTimestamp;
     private earlyLogger;
     private disabledToolsCache;
-    constructor(instanceContext?: InstanceContext, earlyLogger?: EarlyErrorLogger);
+    private ownsResources;
+    constructor(instanceContext?: InstanceContext, earlyLogger?: EarlyErrorLogger, sharedResources?: SharedResources);
     close(): Promise<void>;
+    getSharedResources(): Promise<SharedResources | null>;
     private initializeDatabase;
     private initializeInMemorySchema;
     private parseSQLStatements;

@@ -137,6 +137,17 @@ interface VersionComparisonInfo {
 
 type NodeInfoResponse = NodeMinimalInfo | NodeStandardInfo | NodeFullInfo | VersionHistoryInfo | VersionComparisonInfo;
 
+/**
+ * Shared resources that can be reused across server instances.
+ * Used for SSE reconnects to avoid recreating expensive database connections.
+ */
+export interface SharedResources {
+  db: DatabaseAdapter;
+  repository: NodeRepository;
+  templateService: TemplateService;
+  cache: SimpleCache;
+}
+
 export class N8NDocumentationMCPServer {
   private server: Server;
   private db: DatabaseAdapter | null = null;
@@ -150,60 +161,82 @@ export class N8NDocumentationMCPServer {
   private previousToolTimestamp: number = Date.now();
   private earlyLogger: EarlyErrorLogger | null = null;
   private disabledToolsCache: Set<string> | null = null;
+  private ownsResources: boolean = true; // Whether we own and should close resources
 
-  constructor(instanceContext?: InstanceContext, earlyLogger?: EarlyErrorLogger) {
+  constructor(instanceContext?: InstanceContext, earlyLogger?: EarlyErrorLogger, sharedResources?: SharedResources) {
     this.instanceContext = instanceContext;
     this.earlyLogger = earlyLogger || null;
-    // Check for test environment first
-    const envDbPath = process.env.NODE_DB_PATH;
-    let dbPath: string | null = null;
-    
-    let possiblePaths: string[] = [];
-    
-    if (envDbPath && (envDbPath === ':memory:' || existsSync(envDbPath))) {
-      dbPath = envDbPath;
+
+    // Use shared resources if provided (for SSE reconnects - avoids recreating expensive DB)
+    if (sharedResources) {
+      this.db = sharedResources.db;
+      this.repository = sharedResources.repository;
+      this.templateService = sharedResources.templateService;
+      this.cache = sharedResources.cache;
+      this.ownsResources = false; // Don't close shared resources
+
+      // Already initialized - just log tool count
+      this.initialized = Promise.resolve().then(() => {
+        const apiConfigured = isN8nApiConfigured();
+        const totalTools = apiConfigured ?
+          n8nDocumentationToolsFinal.length + n8nManagementTools.length :
+          n8nDocumentationToolsFinal.length;
+        logger.info(`MCP server initialized with shared resources (${totalTools} tools)`);
+      });
+
+      logger.info('Initializing n8n Documentation MCP server with shared resources');
     } else {
-      // Try multiple database paths
-      possiblePaths = [
-        path.join(process.cwd(), 'data', 'nodes.db'),
-        path.join(__dirname, '../../data', 'nodes.db'),
-        './data/nodes.db'
-      ];
-      
-      for (const p of possiblePaths) {
-        if (existsSync(p)) {
-          dbPath = p;
-          break;
+      // Original path: create own resources
+      const envDbPath = process.env.NODE_DB_PATH;
+      let dbPath: string | null = null;
+
+      let possiblePaths: string[] = [];
+
+      if (envDbPath && (envDbPath === ':memory:' || existsSync(envDbPath))) {
+        dbPath = envDbPath;
+      } else {
+        // Try multiple database paths
+        possiblePaths = [
+          path.join(process.cwd(), 'data', 'nodes.db'),
+          path.join(__dirname, '../../data', 'nodes.db'),
+          './data/nodes.db'
+        ];
+
+        for (const p of possiblePaths) {
+          if (existsSync(p)) {
+            dbPath = p;
+            break;
+          }
         }
       }
-    }
-    
-    if (!dbPath) {
-      logger.error('Database not found in any of the expected locations:', possiblePaths);
-      throw new Error('Database nodes.db not found. Please run npm run rebuild first.');
-    }
-    
-    // Initialize database asynchronously
-    this.initialized = this.initializeDatabase(dbPath).then(() => {
-      // After database is ready, check n8n API configuration (v2.18.3)
-      if (this.earlyLogger) {
-        this.earlyLogger.logCheckpoint(STARTUP_CHECKPOINTS.N8N_API_CHECKING);
+
+      if (!dbPath) {
+        logger.error('Database not found in any of the expected locations:', possiblePaths);
+        throw new Error('Database nodes.db not found. Please run npm run rebuild first.');
       }
 
-      // Log n8n API configuration status at startup
-      const apiConfigured = isN8nApiConfigured();
-      const totalTools = apiConfigured ?
-        n8nDocumentationToolsFinal.length + n8nManagementTools.length :
-        n8nDocumentationToolsFinal.length;
+      // Initialize database asynchronously
+      this.initialized = this.initializeDatabase(dbPath).then(() => {
+        // After database is ready, check n8n API configuration (v2.18.3)
+        if (this.earlyLogger) {
+          this.earlyLogger.logCheckpoint(STARTUP_CHECKPOINTS.N8N_API_CHECKING);
+        }
 
-      logger.info(`MCP server initialized with ${totalTools} tools (n8n API: ${apiConfigured ? 'configured' : 'not configured'})`);
+        // Log n8n API configuration status at startup
+        const apiConfigured = isN8nApiConfigured();
+        const totalTools = apiConfigured ?
+          n8nDocumentationToolsFinal.length + n8nManagementTools.length :
+          n8nDocumentationToolsFinal.length;
 
-      if (this.earlyLogger) {
-        this.earlyLogger.logCheckpoint(STARTUP_CHECKPOINTS.N8N_API_READY);
-      }
-    });
+        logger.info(`MCP server initialized with ${totalTools} tools (n8n API: ${apiConfigured ? 'configured' : 'not configured'})`);
 
-    logger.info('Initializing n8n Documentation MCP server');
+        if (this.earlyLogger) {
+          this.earlyLogger.logCheckpoint(STARTUP_CHECKPOINTS.N8N_API_READY);
+        }
+      });
+
+      logger.info('Initializing n8n Documentation MCP server');
+    }
     
     this.server = new Server(
       {
@@ -252,29 +285,51 @@ export class N8NDocumentationMCPServer {
     try {
       await this.server.close();
 
-      // Use destroy() not clear() - also stops the cleanup timer
-      this.cache.destroy();
+      // Only close resources if we own them (not shared)
+      if (this.ownsResources) {
+        // Use destroy() not clear() - also stops the cleanup timer
+        this.cache.destroy();
 
-      // Close database connection before nullifying reference
-      if (this.db) {
-        try {
-          this.db.close();
-        } catch (dbError) {
-          logger.warn('Error closing database', {
-            error: dbError instanceof Error ? dbError.message : String(dbError)
-          });
+        // Close database connection before nullifying reference
+        if (this.db) {
+          try {
+            this.db.close();
+          } catch (dbError) {
+            logger.warn('Error closing database', {
+              error: dbError instanceof Error ? dbError.message : String(dbError)
+            });
+          }
         }
-      }
 
-      // Null out references to help garbage collection
-      this.db = null;
-      this.repository = null;
-      this.templateService = null;
+        // Null out references to help garbage collection
+        this.db = null;
+        this.repository = null;
+        this.templateService = null;
+      }
+      // If using shared resources, just clear our references without closing
+
       this.earlyLogger = null;
     } catch (error) {
       // Log but don't throw - cleanup should be best-effort
       logger.warn('Error closing MCP server', { error: error instanceof Error ? error.message : String(error) });
     }
+  }
+
+  /**
+   * Get the shared resources for reuse in other server instances.
+   * Only valid after initialization is complete.
+   */
+  async getSharedResources(): Promise<SharedResources | null> {
+    await this.initialized;
+    if (!this.db || !this.repository || !this.templateService) {
+      return null;
+    }
+    return {
+      db: this.db,
+      repository: this.repository,
+      templateService: this.templateService,
+      cache: this.cache
+    };
   }
 
   private async initializeDatabase(dbPath: string): Promise<void> {

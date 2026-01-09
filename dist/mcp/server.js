@@ -70,7 +70,7 @@ const protocol_version_1 = require("../utils/protocol-version");
 const telemetry_1 = require("../telemetry");
 const startup_checkpoints_1 = require("../telemetry/startup-checkpoints");
 class N8NDocumentationMCPServer {
-    constructor(instanceContext, earlyLogger) {
+    constructor(instanceContext, earlyLogger, sharedResources) {
         this.db = null;
         this.repository = null;
         this.templateService = null;
@@ -80,46 +80,64 @@ class N8NDocumentationMCPServer {
         this.previousToolTimestamp = Date.now();
         this.earlyLogger = null;
         this.disabledToolsCache = null;
+        this.ownsResources = true;
         this.dbHealthChecked = false;
         this.instanceContext = instanceContext;
         this.earlyLogger = earlyLogger || null;
-        const envDbPath = process.env.NODE_DB_PATH;
-        let dbPath = null;
-        let possiblePaths = [];
-        if (envDbPath && (envDbPath === ':memory:' || (0, fs_1.existsSync)(envDbPath))) {
-            dbPath = envDbPath;
+        if (sharedResources) {
+            this.db = sharedResources.db;
+            this.repository = sharedResources.repository;
+            this.templateService = sharedResources.templateService;
+            this.cache = sharedResources.cache;
+            this.ownsResources = false;
+            this.initialized = Promise.resolve().then(() => {
+                const apiConfigured = (0, n8n_api_1.isN8nApiConfigured)();
+                const totalTools = apiConfigured ?
+                    tools_1.n8nDocumentationToolsFinal.length + tools_n8n_manager_1.n8nManagementTools.length :
+                    tools_1.n8nDocumentationToolsFinal.length;
+                logger_1.logger.info(`MCP server initialized with shared resources (${totalTools} tools)`);
+            });
+            logger_1.logger.info('Initializing n8n Documentation MCP server with shared resources');
         }
         else {
-            possiblePaths = [
-                path_1.default.join(process.cwd(), 'data', 'nodes.db'),
-                path_1.default.join(__dirname, '../../data', 'nodes.db'),
-                './data/nodes.db'
-            ];
-            for (const p of possiblePaths) {
-                if ((0, fs_1.existsSync)(p)) {
-                    dbPath = p;
-                    break;
+            const envDbPath = process.env.NODE_DB_PATH;
+            let dbPath = null;
+            let possiblePaths = [];
+            if (envDbPath && (envDbPath === ':memory:' || (0, fs_1.existsSync)(envDbPath))) {
+                dbPath = envDbPath;
+            }
+            else {
+                possiblePaths = [
+                    path_1.default.join(process.cwd(), 'data', 'nodes.db'),
+                    path_1.default.join(__dirname, '../../data', 'nodes.db'),
+                    './data/nodes.db'
+                ];
+                for (const p of possiblePaths) {
+                    if ((0, fs_1.existsSync)(p)) {
+                        dbPath = p;
+                        break;
+                    }
                 }
             }
-        }
-        if (!dbPath) {
-            logger_1.logger.error('Database not found in any of the expected locations:', possiblePaths);
-            throw new Error('Database nodes.db not found. Please run npm run rebuild first.');
-        }
-        this.initialized = this.initializeDatabase(dbPath).then(() => {
-            if (this.earlyLogger) {
-                this.earlyLogger.logCheckpoint(startup_checkpoints_1.STARTUP_CHECKPOINTS.N8N_API_CHECKING);
+            if (!dbPath) {
+                logger_1.logger.error('Database not found in any of the expected locations:', possiblePaths);
+                throw new Error('Database nodes.db not found. Please run npm run rebuild first.');
             }
-            const apiConfigured = (0, n8n_api_1.isN8nApiConfigured)();
-            const totalTools = apiConfigured ?
-                tools_1.n8nDocumentationToolsFinal.length + tools_n8n_manager_1.n8nManagementTools.length :
-                tools_1.n8nDocumentationToolsFinal.length;
-            logger_1.logger.info(`MCP server initialized with ${totalTools} tools (n8n API: ${apiConfigured ? 'configured' : 'not configured'})`);
-            if (this.earlyLogger) {
-                this.earlyLogger.logCheckpoint(startup_checkpoints_1.STARTUP_CHECKPOINTS.N8N_API_READY);
-            }
-        });
-        logger_1.logger.info('Initializing n8n Documentation MCP server');
+            this.initialized = this.initializeDatabase(dbPath).then(() => {
+                if (this.earlyLogger) {
+                    this.earlyLogger.logCheckpoint(startup_checkpoints_1.STARTUP_CHECKPOINTS.N8N_API_CHECKING);
+                }
+                const apiConfigured = (0, n8n_api_1.isN8nApiConfigured)();
+                const totalTools = apiConfigured ?
+                    tools_1.n8nDocumentationToolsFinal.length + tools_n8n_manager_1.n8nManagementTools.length :
+                    tools_1.n8nDocumentationToolsFinal.length;
+                logger_1.logger.info(`MCP server initialized with ${totalTools} tools (n8n API: ${apiConfigured ? 'configured' : 'not configured'})`);
+                if (this.earlyLogger) {
+                    this.earlyLogger.logCheckpoint(startup_checkpoints_1.STARTUP_CHECKPOINTS.N8N_API_READY);
+                }
+            });
+            logger_1.logger.info('Initializing n8n Documentation MCP server');
+        }
         this.server = new index_js_1.Server({
             name: 'n8n-documentation-mcp',
             version: version_1.PROJECT_VERSION,
@@ -151,25 +169,39 @@ class N8NDocumentationMCPServer {
     async close() {
         try {
             await this.server.close();
-            this.cache.destroy();
-            if (this.db) {
-                try {
-                    this.db.close();
+            if (this.ownsResources) {
+                this.cache.destroy();
+                if (this.db) {
+                    try {
+                        this.db.close();
+                    }
+                    catch (dbError) {
+                        logger_1.logger.warn('Error closing database', {
+                            error: dbError instanceof Error ? dbError.message : String(dbError)
+                        });
+                    }
                 }
-                catch (dbError) {
-                    logger_1.logger.warn('Error closing database', {
-                        error: dbError instanceof Error ? dbError.message : String(dbError)
-                    });
-                }
+                this.db = null;
+                this.repository = null;
+                this.templateService = null;
             }
-            this.db = null;
-            this.repository = null;
-            this.templateService = null;
             this.earlyLogger = null;
         }
         catch (error) {
             logger_1.logger.warn('Error closing MCP server', { error: error instanceof Error ? error.message : String(error) });
         }
+    }
+    async getSharedResources() {
+        await this.initialized;
+        if (!this.db || !this.repository || !this.templateService) {
+            return null;
+        }
+        return {
+            db: this.db,
+            repository: this.repository,
+            templateService: this.templateService,
+            cache: this.cache
+        };
     }
     async initializeDatabase(dbPath) {
         try {

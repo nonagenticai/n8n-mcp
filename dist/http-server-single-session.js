@@ -51,6 +51,7 @@ class SingleSessionHTTPServer {
         this.sessionContexts = {};
         this.contextSwitchLocks = new Map();
         this.session = null;
+        this.sseSharedResources = null;
         this.consoleManager = new console_manager_1.ConsoleManager();
         this.sessionTimeout = 30 * 60 * 1000;
         this.authToken = null;
@@ -435,7 +436,7 @@ class SingleSessionHTTPServer {
     async resetSessionSSE(res) {
         if (this.session) {
             try {
-                logger_1.logger.info('Closing previous session for SSE', { sessionId: this.session.sessionId });
+                logger_1.logger.info('Closing previous SSE session', { sessionId: this.session.sessionId });
                 await this.session.server.close();
                 await this.session.transport.close();
             }
@@ -444,8 +445,18 @@ class SingleSessionHTTPServer {
             }
         }
         try {
-            logger_1.logger.info('Creating new N8NDocumentationMCPServer for SSE...');
-            const server = new server_1.N8NDocumentationMCPServer();
+            if (!this.sseSharedResources) {
+                logger_1.logger.info('Creating shared resources for SSE (first connection)...');
+                const initialServer = new server_1.N8NDocumentationMCPServer();
+                this.sseSharedResources = await initialServer.getSharedResources();
+                if (!this.sseSharedResources) {
+                    throw new Error('Failed to get shared resources from initial server');
+                }
+                await initialServer.close();
+                logger_1.logger.info('Shared resources created successfully');
+            }
+            logger_1.logger.info('Creating N8NDocumentationMCPServer with shared resources...');
+            const server = new server_1.N8NDocumentationMCPServer(undefined, undefined, this.sseSharedResources);
             const sessionId = (0, uuid_1.v4)();
             logger_1.logger.info('Creating SSEServerTransport...');
             const transport = new sse_js_1.SSEServerTransport('/mcp', res);
@@ -459,7 +470,7 @@ class SingleSessionHTTPServer {
                 initialized: false,
                 isSSE: true
             };
-            logger_1.logger.info('Created new SSE session successfully', { sessionId: this.session.sessionId });
+            logger_1.logger.info('Created SSE session with shared resources', { sessionId: this.session.sessionId });
         }
         catch (error) {
             logger_1.logger.error('Failed to create SSE session:', error);

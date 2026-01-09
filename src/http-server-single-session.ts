@@ -8,7 +8,7 @@ import express from 'express';
 import rateLimit from 'express-rate-limit';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
-import { N8NDocumentationMCPServer } from './mcp/server';
+import { N8NDocumentationMCPServer, SharedResources } from './mcp/server';
 import { ConsoleManager } from './utils/console-manager';
 import { logger } from './utils/logger';
 import { AuthManager } from './utils/auth';
@@ -104,6 +104,7 @@ export class SingleSessionHTTPServer {
   private sessionContexts: { [sessionId: string]: InstanceContext | undefined } = {};
   private contextSwitchLocks: Map<string, Promise<void>> = new Map();
   private session: Session | null = null;  // Keep for SSE compatibility
+  private sseSharedResources: SharedResources | null = null;  // Reused across SSE reconnects
   private consoleManager = new ConsoleManager();
   private expressServer: any;
   private sessionTimeout = 30 * 60 * 1000; // 30 minutes
@@ -672,38 +673,48 @@ export class SingleSessionHTTPServer {
   
 
   /**
-   * Reset the session for SSE - clean up old and create new SSE transport
+   * Reset the session for SSE - reuse shared resources, only create new transport
    */
   private async resetSessionSSE(res: express.Response): Promise<void> {
     // Clean up old session if exists
     if (this.session) {
       try {
-        logger.info('Closing previous session for SSE', { sessionId: this.session.sessionId });
-        // CRITICAL: Close server FIRST to free SQLite/FTS5/cache resources
-        // This was missing and caused memory leak - each SSE reconnect leaked ~100MB
+        logger.info('Closing previous SSE session', { sessionId: this.session.sessionId });
+        // Close server (will not close shared resources due to ownsResources flag)
         await this.session.server.close();
         await this.session.transport.close();
       } catch (error) {
         logger.warn('Error closing previous session:', error);
       }
     }
-    
+
     try {
-      // Create new session
-      logger.info('Creating new N8NDocumentationMCPServer for SSE...');
-      const server = new N8NDocumentationMCPServer();
-      
+      // Initialize shared resources on first SSE connection
+      if (!this.sseSharedResources) {
+        logger.info('Creating shared resources for SSE (first connection)...');
+        const initialServer = new N8NDocumentationMCPServer();
+        this.sseSharedResources = await initialServer.getSharedResources();
+        if (!this.sseSharedResources) {
+          throw new Error('Failed to get shared resources from initial server');
+        }
+        // Close the initial server (but resources stay open since we extracted them)
+        await initialServer.close();
+        logger.info('Shared resources created successfully');
+      }
+
+      // Create new server with shared resources (lightweight - no DB init)
+      logger.info('Creating N8NDocumentationMCPServer with shared resources...');
+      const server = new N8NDocumentationMCPServer(undefined, undefined, this.sseSharedResources);
+
       // Generate cryptographically secure session ID
       const sessionId = uuidv4();
-      
+
       logger.info('Creating SSEServerTransport...');
       const transport = new SSEServerTransport('/mcp', res);
-      
+
       logger.info('Connecting server to SSE transport...');
       await server.connect(transport);
-      
-      // Note: server.connect() automatically calls transport.start(), so we don't need to call it again
-      
+
       this.session = {
         server,
         transport,
@@ -712,8 +723,8 @@ export class SingleSessionHTTPServer {
         initialized: false,
         isSSE: true
       };
-      
-      logger.info('Created new SSE session successfully', { sessionId: this.session.sessionId });
+
+      logger.info('Created SSE session with shared resources', { sessionId: this.session.sessionId });
     } catch (error) {
       logger.error('Failed to create SSE session:', error);
       throw error;

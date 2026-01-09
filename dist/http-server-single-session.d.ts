@@ -9,6 +9,7 @@ export declare class SingleSessionHTTPServer {
     private sessionContexts;
     private contextSwitchLocks;
     private session;
+    private sseSharedResources;
     private consoleManager;
     private expressServer;
     private sessionTimeout;
