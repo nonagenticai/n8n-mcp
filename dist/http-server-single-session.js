@@ -436,6 +436,7 @@ class SingleSessionHTTPServer {
         if (this.session) {
             try {
                 logger_1.logger.info('Closing previous session for SSE', { sessionId: this.session.sessionId });
+                await this.session.server.close();
                 await this.session.transport.close();
             }
             catch (error) {

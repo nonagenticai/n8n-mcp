@@ -679,6 +679,9 @@ export class SingleSessionHTTPServer {
     if (this.session) {
       try {
         logger.info('Closing previous session for SSE', { sessionId: this.session.sessionId });
+        // CRITICAL: Close server FIRST to free SQLite/FTS5/cache resources
+        // This was missing and caused memory leak - each SSE reconnect leaked ~100MB
+        await this.session.server.close();
         await this.session.transport.close();
       } catch (error) {
         logger.warn('Error closing previous session:', error);

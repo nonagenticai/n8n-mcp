@@ -1,10 +1,20 @@
 import { DatabaseAdapter } from './database-adapter';
 import { ParsedNode } from '../parsers/node-parser';
 import { SQLiteStorageService } from '../services/sqlite-storage-service';
+export interface CommunityNodeFields {
+    isCommunity: boolean;
+    isVerified: boolean;
+    authorName?: string;
+    authorGithubUrl?: string;
+    npmPackageName?: string;
+    npmVersion?: string;
+    npmDownloads?: number;
+    communityFetchedAt?: string;
+}
 export declare class NodeRepository {
     private db;
     constructor(dbOrService: DatabaseAdapter | SQLiteStorageService);
-    saveNode(node: ParsedNode): void;
+    saveNode(node: ParsedNode & Partial<CommunityNodeFields>): void;
     getNode(nodeType: string): any;
     getAITools(): any[];
     private safeJsonParse;
@@ -29,6 +39,30 @@ export declare class NodeRepository {
     getAllResources(): Map<string, any[]>;
     getNodePropertyDefaults(nodeType: string): Record<string, any>;
     getDefaultOperationForResource(nodeType: string, resource?: string): string | undefined;
+    getCommunityNodes(options?: {
+        verified?: boolean;
+        limit?: number;
+        orderBy?: 'downloads' | 'name' | 'updated';
+    }): any[];
+    getCommunityStats(): {
+        total: number;
+        verified: number;
+        unverified: number;
+    };
+    hasNodeByNpmPackage(npmPackageName: string): boolean;
+    getNodeByNpmPackage(npmPackageName: string): any | null;
+    deleteCommunityNodes(): number;
+    updateNodeReadme(nodeType: string, readme: string): void;
+    updateNodeAISummary(nodeType: string, summary: object): void;
+    getCommunityNodesWithoutReadme(): any[];
+    getCommunityNodesWithoutAISummary(): any[];
+    getDocumentationStats(): {
+        total: number;
+        withReadme: number;
+        withAISummary: number;
+        needingReadme: number;
+        needingAISummary: number;
+    };
     saveNodeVersion(versionData: {
         nodeType: string;
         version: string;

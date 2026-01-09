@@ -155,17 +155,17 @@ export declare const workflowConnectionSchema: z.ZodRecord<z.ZodString, z.ZodObj
         node: string;
         index: number;
     }[][] | undefined;
+    ai_tool?: {
+        type: string;
+        node: string;
+        index: number;
+    }[][] | undefined;
     ai_languageModel?: {
         type: string;
         node: string;
         index: number;
     }[][] | undefined;
     ai_memory?: {
-        type: string;
-        node: string;
-        index: number;
-    }[][] | undefined;
-    ai_tool?: {
         type: string;
         node: string;
         index: number;
@@ -191,17 +191,17 @@ export declare const workflowConnectionSchema: z.ZodRecord<z.ZodString, z.ZodObj
         node: string;
         index: number;
     }[][] | undefined;
+    ai_tool?: {
+        type: string;
+        node: string;
+        index: number;
+    }[][] | undefined;
     ai_languageModel?: {
         type: string;
         node: string;
         index: number;
     }[][] | undefined;
     ai_memory?: {
-        type: string;
-        node: string;
-        index: number;
-    }[][] | undefined;
-    ai_tool?: {
         type: string;
         node: string;
         index: number;

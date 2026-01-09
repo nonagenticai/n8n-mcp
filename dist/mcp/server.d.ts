@@ -40,6 +40,7 @@ export declare class N8NDocumentationMCPServer {
     private rankSearchResults;
     private listAITools;
     private getNodeDocumentation;
+    private safeJsonParse;
     private getDatabaseStatistics;
     private getNodeEssentials;
     private getNode;

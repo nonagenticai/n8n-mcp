@@ -85,6 +85,9 @@ async function shutdown() {
     }
 }
 async function startFixedHTTPServer() {
+    logger_1.logger.warn('DEPRECATION: startFixedHTTPServer() is deprecated as of v2.31.8. ' +
+        'Use SingleSessionHTTPServer which supports SSE streaming. ' +
+        'See: https://github.com/czlonkowski/n8n-mcp/issues/524');
     validateEnvironment();
     const app = (0, express_1.default)();
     const trustProxy = process.env.TRUST_PROXY ? Number(process.env.TRUST_PROXY) : 0;

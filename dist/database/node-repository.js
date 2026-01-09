@@ -19,10 +19,12 @@ class NodeRepository {
         is_webhook, is_versioned, is_tool_variant, tool_variant_of,
         has_tool_variant, version, documentation,
         properties_schema, operations, credentials_required,
-        outputs, output_names
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        outputs, output_names,
+        is_community, is_verified, author_name, author_github_url,
+        npm_package_name, npm_version, npm_downloads, community_fetched_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
-        stmt.run(node.nodeType, node.packageName, node.displayName, node.description, node.category, node.style, node.isAITool ? 1 : 0, node.isTrigger ? 1 : 0, node.isWebhook ? 1 : 0, node.isVersioned ? 1 : 0, node.isToolVariant ? 1 : 0, node.toolVariantOf || null, node.hasToolVariant ? 1 : 0, node.version, node.documentation || null, JSON.stringify(node.properties, null, 2), JSON.stringify(node.operations, null, 2), JSON.stringify(node.credentials, null, 2), node.outputs ? JSON.stringify(node.outputs, null, 2) : null, node.outputNames ? JSON.stringify(node.outputNames, null, 2) : null);
+        stmt.run(node.nodeType, node.packageName, node.displayName, node.description, node.category, node.style, node.isAITool ? 1 : 0, node.isTrigger ? 1 : 0, node.isWebhook ? 1 : 0, node.isVersioned ? 1 : 0, node.isToolVariant ? 1 : 0, node.toolVariantOf || null, node.hasToolVariant ? 1 : 0, node.version, node.documentation || null, JSON.stringify(node.properties, null, 2), JSON.stringify(node.operations, null, 2), JSON.stringify(node.credentials, null, 2), node.outputs ? JSON.stringify(node.outputs, null, 2) : null, node.outputNames ? JSON.stringify(node.outputNames, null, 2) : null, node.isCommunity ? 1 : 0, node.isVerified ? 1 : 0, node.authorName || null, node.authorGithubUrl || null, node.npmPackageName || null, node.npmVersion || null, node.npmDownloads || 0, node.communityFetchedAt || null);
     }
     getNode(nodeType) {
         const normalizedType = node_type_normalizer_1.NodeTypeNormalizer.normalizeToFullForm(nodeType);
@@ -35,6 +37,14 @@ class NodeRepository {
       `).get(nodeType);
             if (originalRow) {
                 return this.parseNodeRow(originalRow);
+            }
+        }
+        if (!row) {
+            const caseInsensitiveRow = this.db.prepare(`
+        SELECT * FROM nodes WHERE LOWER(node_type) = LOWER(?)
+      `).get(nodeType);
+            if (caseInsensitiveRow) {
+                return this.parseNodeRow(caseInsensitiveRow);
             }
         }
         if (!row)
@@ -214,7 +224,20 @@ class NodeRepository {
             credentials: this.safeJsonParse(row.credentials_required, []),
             hasDocumentation: !!row.documentation,
             outputs: row.outputs ? this.safeJsonParse(row.outputs, null) : null,
-            outputNames: row.output_names ? this.safeJsonParse(row.output_names, null) : null
+            outputNames: row.output_names ? this.safeJsonParse(row.output_names, null) : null,
+            isCommunity: Number(row.is_community) === 1,
+            isVerified: Number(row.is_verified) === 1,
+            authorName: row.author_name || null,
+            authorGithubUrl: row.author_github_url || null,
+            npmPackageName: row.npm_package_name || null,
+            npmVersion: row.npm_version || null,
+            npmDownloads: row.npm_downloads || 0,
+            communityFetchedAt: row.community_fetched_at || null,
+            npmReadme: row.npm_readme || null,
+            aiDocumentationSummary: row.ai_documentation_summary
+                ? this.safeJsonParse(row.ai_documentation_summary, null)
+                : null,
+            aiSummaryGeneratedAt: row.ai_summary_generated_at || null,
         };
     }
     getNodeOperations(nodeType, resource) {
@@ -359,6 +382,98 @@ class NodeRepository {
             return undefined;
         }
         return undefined;
+    }
+    getCommunityNodes(options) {
+        let sql = 'SELECT * FROM nodes WHERE is_community = 1';
+        const params = [];
+        if (options?.verified !== undefined) {
+            sql += ' AND is_verified = ?';
+            params.push(options.verified ? 1 : 0);
+        }
+        switch (options?.orderBy) {
+            case 'downloads':
+                sql += ' ORDER BY npm_downloads DESC';
+                break;
+            case 'updated':
+                sql += ' ORDER BY community_fetched_at DESC';
+                break;
+            case 'name':
+            default:
+                sql += ' ORDER BY display_name';
+        }
+        if (options?.limit) {
+            sql += ' LIMIT ?';
+            params.push(options.limit);
+        }
+        const rows = this.db.prepare(sql).all(...params);
+        return rows.map(row => this.parseNodeRow(row));
+    }
+    getCommunityStats() {
+        const totalResult = this.db.prepare('SELECT COUNT(*) as count FROM nodes WHERE is_community = 1').get();
+        const verifiedResult = this.db.prepare('SELECT COUNT(*) as count FROM nodes WHERE is_community = 1 AND is_verified = 1').get();
+        return {
+            total: totalResult.count,
+            verified: verifiedResult.count,
+            unverified: totalResult.count - verifiedResult.count
+        };
+    }
+    hasNodeByNpmPackage(npmPackageName) {
+        const result = this.db.prepare('SELECT 1 FROM nodes WHERE npm_package_name = ? LIMIT 1').get(npmPackageName);
+        return !!result;
+    }
+    getNodeByNpmPackage(npmPackageName) {
+        const row = this.db.prepare('SELECT * FROM nodes WHERE npm_package_name = ?').get(npmPackageName);
+        if (!row)
+            return null;
+        return this.parseNodeRow(row);
+    }
+    deleteCommunityNodes() {
+        const result = this.db.prepare('DELETE FROM nodes WHERE is_community = 1').run();
+        return result.changes;
+    }
+    updateNodeReadme(nodeType, readme) {
+        const stmt = this.db.prepare(`
+      UPDATE nodes SET npm_readme = ? WHERE node_type = ?
+    `);
+        stmt.run(readme, nodeType);
+    }
+    updateNodeAISummary(nodeType, summary) {
+        const stmt = this.db.prepare(`
+      UPDATE nodes
+      SET ai_documentation_summary = ?, ai_summary_generated_at = datetime('now')
+      WHERE node_type = ?
+    `);
+        stmt.run(JSON.stringify(summary), nodeType);
+    }
+    getCommunityNodesWithoutReadme() {
+        const rows = this.db.prepare(`
+      SELECT * FROM nodes
+      WHERE is_community = 1 AND (npm_readme IS NULL OR npm_readme = '')
+      ORDER BY npm_downloads DESC
+    `).all();
+        return rows.map(row => this.parseNodeRow(row));
+    }
+    getCommunityNodesWithoutAISummary() {
+        const rows = this.db.prepare(`
+      SELECT * FROM nodes
+      WHERE is_community = 1
+        AND npm_readme IS NOT NULL AND npm_readme != ''
+        AND (ai_documentation_summary IS NULL OR ai_documentation_summary = '')
+      ORDER BY npm_downloads DESC
+    `).all();
+        return rows.map(row => this.parseNodeRow(row));
+    }
+    getDocumentationStats() {
+        const total = this.db.prepare('SELECT COUNT(*) as count FROM nodes WHERE is_community = 1').get().count;
+        const withReadme = this.db.prepare("SELECT COUNT(*) as count FROM nodes WHERE is_community = 1 AND npm_readme IS NOT NULL AND npm_readme != ''").get().count;
+        const withAISummary = this.db.prepare("SELECT COUNT(*) as count FROM nodes WHERE is_community = 1 AND ai_documentation_summary IS NOT NULL AND ai_documentation_summary != ''").get().count;
+        return {
+            total,
+            withReadme,
+            withAISummary,
+            needingReadme: total - withReadme,
+            needingAISummary: withReadme - withAISummary
+        };
     }
     saveNodeVersion(versionData) {
         const stmt = this.db.prepare(`
