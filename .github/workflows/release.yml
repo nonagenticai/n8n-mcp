@@ -456,16 +456,16 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Verify multi-arch manifest for latest tag
+      - name: Verify manifest for latest tag
         run: |
-          echo "Verifying multi-arch manifest for latest tag..."
+          echo "Verifying manifest for latest tag..."
 
           # Retry with exponential backoff (registry propagation can take time)
           MAX_ATTEMPTS=5
@@ -477,15 +477,15 @@ jobs:
 
             MANIFEST=$(docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest 2>&1 || true)
 
-            # Check for both platforms
-            if echo "$MANIFEST" | grep -q "linux/amd64" && echo "$MANIFEST" | grep -q "linux/arm64"; then
-              echo "✅ Multi-arch manifest verified: both amd64 and arm64 present"
+            # Check for amd64 platform
+            if echo "$MANIFEST" | grep -q "linux/amd64"; then
+              echo "Manifest verified: amd64 present"
               echo "$MANIFEST"
               exit 0
             fi
 
             if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
-              echo "⏳ Registry still propagating, waiting ${WAIT_TIME}s before retry..."
+              echo "Registry still propagating, waiting ${WAIT_TIME}s before retry..."
               sleep $WAIT_TIME
               WAIT_TIME=$((WAIT_TIME * 2))  # Exponential backoff: 2s, 4s, 8s, 16s
             fi
@@ -493,14 +493,14 @@ jobs:
             ATTEMPT=$((ATTEMPT + 1))
           done
 
-          echo "❌ ERROR: Multi-arch manifest incomplete after $MAX_ATTEMPTS attempts!"
+          echo "ERROR: Manifest incomplete after $MAX_ATTEMPTS attempts!"
           echo "$MANIFEST"
           exit 1
 
-      - name: Verify multi-arch manifest for version tag
+      - name: Verify manifest for version tag
         run: |
           VERSION="${{ needs.detect-version-change.outputs.new-version }}"
-          echo "Verifying multi-arch manifest for version tag :$VERSION (without 'v' prefix)..."
+          echo "Verifying manifest for version tag :$VERSION (without 'v' prefix)..."
 
           # Retry with exponential backoff (registry propagation can take time)
           MAX_ATTEMPTS=5
@@ -512,15 +512,15 @@ jobs:
 
             MANIFEST=$(docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$VERSION 2>&1 || true)
 
-            # Check for both platforms
-            if echo "$MANIFEST" | grep -q "linux/amd64" && echo "$MANIFEST" | grep -q "linux/arm64"; then
-              echo "✅ Multi-arch manifest verified for $VERSION: both amd64 and arm64 present"
+            # Check for amd64 platform
+            if echo "$MANIFEST" | grep -q "linux/amd64"; then
+              echo "Manifest verified for $VERSION: amd64 present"
               echo "$MANIFEST"
               exit 0
             fi
 
             if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
-              echo "⏳ Registry still propagating, waiting ${WAIT_TIME}s before retry..."
+              echo "Registry still propagating, waiting ${WAIT_TIME}s before retry..."
               sleep $WAIT_TIME
               WAIT_TIME=$((WAIT_TIME * 2))  # Exponential backoff: 2s, 4s, 8s, 16s
             fi
@@ -528,7 +528,7 @@ jobs:
             ATTEMPT=$((ATTEMPT + 1))
           done
 
-          echo "❌ ERROR: Multi-arch manifest incomplete for version $VERSION after $MAX_ATTEMPTS attempts!"
+          echo "ERROR: Manifest incomplete for version $VERSION after $MAX_ATTEMPTS attempts!"
           echo "$MANIFEST"
           exit 1
 
