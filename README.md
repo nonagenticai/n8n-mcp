@@ -1210,6 +1210,20 @@ npm run test:bench          # Performance benchmarks
 
 For detailed testing documentation, see [Testing Architecture](./docs/testing-architecture.md).
 
+## CI/CD
+
+GitHub Actions workflows on push to `main` and on pull requests:
+
+1. **Test Suite** (`test.yml`) — `npm ci` → unit tests with coverage → integration tests → lint → typecheck → benchmarks. Runs on `ubuntu-latest` with Node 20. Publishes JUnit results, coverage to Codecov, and benchmark artifacts.
+2. **Docker Build** (`docker-build.yml`) — builds `linux/amd64` images for both standard (`ghcr.io/czlonkowski/n8n-mcp`) and Railway (`ghcr.io/czlonkowski/n8n-mcp-railway`) variants. Pushes to GHCR on merge to `main` with `:latest` and `:sha-<short>` tags.
+3. **Release** (`release.yml`) — triggered when `package.json` version changes on `main`. Creates GitHub Release with auto-generated notes, publishes to npm (`n8n-mcp`), builds and pushes versioned Docker images, and updates README version badges.
+4. **Dependency Check** (`dependency-check.yml`) — audits for known vulnerabilities.
+5. **n8n Update** (`update-n8n-deps.yml`) — checks for new n8n package versions.
+
+## Known Issues
+
+No known issues at this time. No CI failures detected.
+
 ## 📦 License
 
 MIT License - see [LICENSE](LICENSE) for details.
