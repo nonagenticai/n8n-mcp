@@ -140,3 +140,7 @@ n8n-mcp-wrapper.sh
 
 # Telemetry configuration (user-specific)
 ~/.n8n-mcp/
+.local-ci-commit.txt
+.local-ci-push.txt
+01_recent_push_failure.txt
+02_deploy_issues.txt
