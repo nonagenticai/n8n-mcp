@@ -96,11 +96,11 @@ describe('SimpleCache Memory Leak Fix', () => {
     const originalSetInterval = global.setInterval;
     
     // Mock setInterval to track created timers
-    global.setInterval = vi.fn((callback, delay) => {
+    global.setInterval = vi.fn((callback: any, delay: any) => {
       const timer = originalSetInterval(callback, delay);
       timers.push(timer);
       return timer;
-    });
+    }) as unknown as typeof global.setInterval;
     
     // Create and destroy multiple caches
     for (let i = 0; i < 5; i++) {

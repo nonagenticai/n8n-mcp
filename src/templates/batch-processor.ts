@@ -140,7 +140,7 @@ export class BatchProcessor {
       monitoringPromise.then(async (completedJob) => {
         // Cleanup uploaded files after completion
         try {
-          await this.client.files.del(uploadedFile.id);
+          await this.client.files.delete(uploadedFile.id);
           if (completedJob.output_file_id) {
             // Note: We'll delete output file after retrieving results
           }
@@ -401,7 +401,7 @@ export class BatchProcessor {
     
     // Delete uploaded files from OpenAI
     try {
-      await this.client.files.del(inputFileId);
+      await this.client.files.delete(inputFileId);
       logger.debug(`Deleted input file from OpenAI: ${inputFileId}`);
     } catch (error) {
       logger.warn(`Failed to delete input file from OpenAI: ${inputFileId}`, error);
@@ -409,7 +409,7 @@ export class BatchProcessor {
     
     if (outputFileId) {
       try {
-        await this.client.files.del(outputFileId);
+        await this.client.files.delete(outputFileId);
         logger.debug(`Deleted output file from OpenAI: ${outputFileId}`);
       } catch (error) {
         logger.warn(`Failed to delete output file from OpenAI: ${outputFileId}`, error);

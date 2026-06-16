@@ -75,8 +75,9 @@ describe('MCP Session Management', { timeout: 15000 }, () => {
       expect(serverInfo?.name).toBe('n8n-documentation-mcp');
       
       // Check capabilities if they exist
-      if (serverInfo?.capabilities) {
-        expect(serverInfo.capabilities).toHaveProperty('tools');
+      const serverInfoAny = serverInfo as any;
+      if (serverInfoAny?.capabilities) {
+        expect(serverInfoAny.capabilities).toHaveProperty('tools');
       }
       
       // Clean up - ensure proper order

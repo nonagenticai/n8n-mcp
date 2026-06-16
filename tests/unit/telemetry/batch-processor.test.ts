@@ -22,7 +22,7 @@ describe('TelemetryBatchProcessor', () => {
   let mockIsEnabled: ReturnType<typeof vi.fn>;
   let mockProcessExit: MockInstance;
 
-  const createMockSupabaseResponse = (error: any = null) => ({
+  const createMockSupabaseResponse = (error: any = null): any => ({
     data: null,
     error,
     status: error ? 400 : 200,
