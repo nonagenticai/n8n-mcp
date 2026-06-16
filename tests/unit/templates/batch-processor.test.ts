@@ -13,7 +13,7 @@ const mockClient = {
   files: {
     create: vi.fn(),
     content: vi.fn(),
-    del: vi.fn()
+    delete: vi.fn()
   },
   batches: {
     create: vi.fn(),
@@ -675,8 +675,8 @@ describe('BatchProcessor', () => {
       await (processor as any).cleanup('local-file.jsonl', 'input-123', 'output-456');
 
       expect(mockedFs.unlinkSync).toHaveBeenCalledWith('local-file.jsonl');
-      expect(mockClient.files.del).toHaveBeenCalledWith('input-123');
-      expect(mockClient.files.del).toHaveBeenCalledWith('output-456');
+      expect(mockClient.files.delete).toHaveBeenCalledWith('input-123');
+      expect(mockClient.files.delete).toHaveBeenCalledWith('output-456');
     });
 
     it('should handle local file deletion errors gracefully', async () => {
@@ -691,7 +691,7 @@ describe('BatchProcessor', () => {
     });
 
     it('should handle OpenAI file deletion errors gracefully', async () => {
-      mockClient.files.del.mockRejectedValue(new Error('Delete failed'));
+      mockClient.files.delete.mockRejectedValue(new Error('Delete failed'));
 
       // Should not throw error
       await expect(
@@ -703,8 +703,8 @@ describe('BatchProcessor', () => {
       await (processor as any).cleanup('local-file.jsonl', 'input-123');
 
       expect(mockedFs.unlinkSync).toHaveBeenCalledWith('local-file.jsonl');
-      expect(mockClient.files.del).toHaveBeenCalledWith('input-123');
-      expect(mockClient.files.del).toHaveBeenCalledTimes(1); // Only input file
+      expect(mockClient.files.delete).toHaveBeenCalledWith('input-123');
+      expect(mockClient.files.delete).toHaveBeenCalledTimes(1); // Only input file
     });
   });
 
@@ -860,14 +860,14 @@ describe('BatchProcessor', () => {
       await new Promise(resolve => setTimeout(resolve, 50));
 
       // Should have attempted to delete the input file
-      expect(mockClient.files.del).toHaveBeenCalledWith('file-upload-123');
+      expect(mockClient.files.delete).toHaveBeenCalledWith('file-upload-123');
     });
 
     it('should handle cleanup errors gracefully', async () => {
       const templates = [{ templateId: 1, name: 'Test', nodes: ['node1'] }];
 
       mockClient.files.create.mockResolvedValue({ id: 'file-123' });
-      mockClient.files.del.mockRejectedValue(new Error('Delete failed'));
+      mockClient.files.delete.mockRejectedValue(new Error('Delete failed'));
       const completedJob = {
         id: 'batch-123',
         status: 'completed'
@@ -1163,8 +1163,8 @@ describe('BatchProcessor', () => {
 
       // Should clean up all files
       expect(mockedFs.unlinkSync).toHaveBeenCalled();
-      expect(mockClient.files.del).toHaveBeenCalledWith('file-clean');
-      expect(mockClient.files.del).toHaveBeenCalledWith('output-clean');
+      expect(mockClient.files.delete).toHaveBeenCalledWith('file-clean');
+      expect(mockClient.files.delete).toHaveBeenCalledWith('output-clean');
     });
 
     it('should clean up local file on error', async () => {
