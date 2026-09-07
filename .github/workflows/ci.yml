@@ -5,67 +5,64 @@
 # `GET /repos/nonagenticai/n8n-mcp/contents/.github/workflows` returned 404.
 # The only thing evaluating a push was the org-level secret scan. Two older
 # Docker workflows (`docker-build-n8n.yml`, "Build and Push Docker Images")
-# survive in the Actions UI as `completed/failure` against long-dead SHAs; their
+# survive in the Actions UI as `completed/failure` on long-dead SHAs; their
 # files are gone. Net effect: `chore(deps): bump @types/node to 26` (#7) merged
 # to main with literally nothing compiling it.
 #
-# Consumes the shared ts-service archetype rather than a hand-rolled pipeline
-# (house rule: hand-rolled non-archetype workflows are tech debt). The repo fits
-# the archetype cleanly: npm, a tracked root `package-lock.json`, a real `build`
-# script, and a real test suite. Notes on the inputs, so the next reader does not
-# have to re-derive them:
+# ── Why this is NOT the shared ts-service archetype ──────────────────────────
 #
-# - node_version: 24. The repo pins no Node anywhere — no `engines`, no `.nvmrc`
-#   — so there is nothing to contradict. 24 is the archetype's documented floor
-#   and 20 is end-of-life. It also will not need moving again soon: devDeps
-#   already carry `@types/node ^26` and `typescript ^6`, so 24 is the lowest
-#   version consistent with where this repo's toolchain already is.
-#   ⚠️ Known, deliberate gap: `Dockerfile` still builds on node:22-alpine. That
-#   image is NOT exercised here (see docker_build below), so CI and the container
-#   are on different majors. Raising a deploy-facing base image is a separate
-#   decision and is out of scope for a PR whose job is to add a gate.
+# The house rule is to consume `nonagenticai/gitops-production/.github/workflows
+# /ts-service.yml@main` (as n8n-nodes-site #13 did) rather than hand-roll. That
+# was tried here FIRST and it is structurally impossible, not merely awkward:
 #
-# - No image_name / docker_build. There IS a Dockerfile, so this is a choice, not
-#   an absence. n8n-mcp has NO deployment target in gitops-production — a
-#   recursive tree of that repo matches zero paths for "n8n-mcp", so there is no
-#   Deployment, no ImagePolicy and no Flux rollout to drive. Building and pushing
-#   to registry.internal:5000 would burn the heavy dind pool producing an image
-#   with no consumer, which is roughly what the two deleted Docker workflows were
-#   doing when they went red. Leaving both inputs at their defaults ('' / false)
-#   skips the docker build, smoke, push and rollout steps and keeps build-test on
-#   the light pool. ⚠️ Consequence to state plainly: this gate does NOT prove the
-#   Dockerfile still builds. If n8n-mcp ever gets a cluster deployment, set
-#   image_name + docker_build: true and wire deploy_namespace.
+#   Invalid workflow file: .github/workflows/ci.yml#L95
+#   error parsing called workflow
+#   'nonagenticai/gitops-production/.github/workflows/ts-service.yml@main'
+#   : workflow was not found.
 #
-# - allow_no_tests is deliberately NOT set. This repo has 216 test files; opting
-#   out of the archetype's "the test gate actually ran" assertion would restore
-#   exactly the silent-green behaviour that assertion exists to catch.
+# ⚠️ The file is present and the path is correct — the run fails at 0s with zero
+# jobs and zero check-runs because **n8n-mcp is a PUBLIC repo and
+# gitops-production is PRIVATE**. A public repository's Actions context cannot
+# resolve a private repository's reusable workflow, and gitops-production
+# already has `actions/permissions/access = organization`, which does not bridge
+# that gap. Corroborating: n8n-nodes-site (the precedent) is private, and of the
+# six public repos in the org, none consumes the archetype.
 #
-# - test_command. The archetype would otherwise run `npm test`, which is bare
-#   `vitest`, and vitest.config.ts sets NO include/exclude — so the default run
-#   sweeps tests/unit AND tests/integration AND tests/e2e. Only 10 of the 57
-#   integration/e2e files carry a skip guard; the rest expect a live n8n API
-#   (tests/integration/n8n-api/*) and would fail on a hermetic runner. Those
-#   suites already have their own vitest.config.integration.ts and are simply not
-#   CI-ready today — that is a pre-existing condition this PR does not pretend to
-#   fix. So the gate runs the 153-file unit suite, which is hermetic
-#   (NODE_DB_PATH=:memory:, mocked API base URL from .env.test).
-#   FEATURE_TEST_COVERAGE=false is required, not cosmetic: vitest.config.ts
-#   enables coverage by default with 80/80/75/80 thresholds computed over the
-#   whole of src, so running any subset of the suite fails on thresholds rather
-#   than on a real defect. The repo's own `test:ci` script exists to zero those
-#   thresholds; this is the same escape hatch, spelled explicitly.
-#   ⚠️ Scope this gate honestly: it covers unit tests only.
+# So this is a purpose-built workflow that reproduces the archetype's BEHAVIOUR
+# on GitHub-hosted runners. Revisit only if n8n-mcp is ever made private.
 #
-# - test_timeout_minutes: 30. vitest.config.ts runs singleThread unless
-#   TEST_PARALLEL=true and retries failures twice; 153 files can outrun the
-#   archetype's 25m default. Not raising TEST_PARALLEL here on purpose — that
-#   changes test semantics, which is not this PR's job.
+# ⛔ Deliberately `ubuntu-latest`, NOT the internal ARC pools (arc-small /
+# arc-medium / arc-amd64). This repo is PUBLIC, so a pull_request from any fork
+# would execute attacker-authored code on self-hosted runners that sit inside
+# the tailnet with reach to registry.internal / npm.internal / postgres.internal.
+# GitHub-hosted runners are the correct blast radius for a public repo. Same
+# reasoning as gitops-production's tailnet-ACL apply job, which is pinned to
+# ubuntu-latest on purpose.
 #
-# - dependency_audit_level left at the default 'advisory'. The audit still runs
-#   and still fails if it cannot RUN; only findings are downgraded to warnings.
-#   Flipping this repo to blocking is the intended later ratchet, once the
-#   reported counts are known and cleaned.
+# ── Scope, stated honestly ───────────────────────────────────────────────────
+#
+# - This gate BUILDS and TYPE-CHECKS and runs UNIT TESTS. It does NOT lint:
+#   the repo has no eslint, prettier or biome — no config file and no
+#   dependency — so there is nothing to run. `ci:verify` is therefore
+#   `tsc --noEmit`, and calling that "lint" would be a lie.
+#
+# - Node 24. The repo pins Node nowhere (no `engines`, no `.nvmrc`), so there is
+#   nothing to contradict; 20 is EOL, and devDeps already carry
+#   `@types/node ^26` + `typescript ^6`, so 24 is the lowest version consistent
+#   with the toolchain and should not need moving again.
+#   ⚠️ Known gap: `Dockerfile` still builds on node:22-alpine and is NOT
+#   exercised here — it FROMs registry.internal:5000, unreachable from a
+#   GitHub-hosted runner, and n8n-mcp has no deployment target in
+#   gitops-production (recursive tree match for "n8n-mcp" = 0 paths), so there
+#   is no image consumer to build for. Raising a deploy-facing base image is a
+#   separate decision.
+#
+# - Unit tests only. `vitest.config.ts` sets NO include/exclude, so a bare
+#   `vitest` run sweeps tests/unit + tests/integration + tests/e2e; only 10 of
+#   the 57 integration/e2e files carry a skip guard and the rest expect a live
+#   n8n API (tests/integration/n8n-api/*). Those have their own
+#   vitest.config.integration.ts and are not CI-ready — a pre-existing
+#   condition this workflow does not pretend to fix.
 name: CI
 
 on:
@@ -74,7 +71,6 @@ on:
     # DENYLIST, deliberately not an allowlist. `paths-ignore` skips a run only
     # for a change that is entirely documentation; anything unrecognised —
     # including a source directory nobody has thought of yet — still runs.
-    #
     # An allowlist (`paths:`) fails SILENT: add a new source dir, forget to list
     # it, and CI simply stops triggering. "No CI ran" and "CI passed" render
     # identically on a PR, so the regression ships green.
@@ -90,11 +86,81 @@ on:
       - '.gitignore'
   workflow_dispatch:
 
+# Least privilege: this workflow only ever reads source.
+permissions:
+  contents: read
+
+concurrency:
+  # Scoped per ref so branches cannot evict each other's queued runs. main is
+  # uncancellable by construction: the expression is false on refs/heads/main.
+  group: ci-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
-  ci:
-    uses: nonagenticai/gitops-production/.github/workflows/ts-service.yml@main
-    with:
-      node_version: "24"
-      test_command: "FEATURE_TEST_COVERAGE=false npm run test:unit"
-      test_timeout_minutes: 30
-    secrets: inherit
+  build-test:
+    name: build-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          # Hard-fails without a tracked root lockfile. package-lock.json IS
+          # tracked here (verified: `git ls-files --error-unmatch` exits 0),
+          # which is load-bearing beyond the cache: without a lock, `npm ci`
+          # cannot run and installs would re-resolve floating `^` ranges, so the
+          # gate would not be reproducible run to run.
+          cache: 'npm'
+
+      # `npm ci` (not `npm install`) — fails if package.json and the lockfile
+      # disagree, and never mutates the lockfile.
+      - name: Install dependencies
+        run: npm ci
+
+      # Unconditional and direct. The shared archetype gates this behind a probe
+      # for a `ci:verify` script and prints "no ci:verify script — skipping"
+      # otherwise, which yields a green check that cannot fail. There is no
+      # probe here: if `ci:verify` were missing, `npm run` exits non-zero and
+      # this step goes RED rather than quietly passing.
+      #
+      # `ci:verify` -> `npm run typecheck` -> `tsc --noEmit`, which under
+      # tsconfig.json covers src/** + tests/** + types/** — a strictly wider
+      # surface than the build below (src only, via tsconfig.build.json).
+      # This is the step that would have caught #7's @types/node bump.
+      - name: Type-check (ci:verify)
+        run: npm run ci:verify
+
+      - name: Build
+        run: npm run build
+
+      # FEATURE_TEST_COVERAGE=false is REQUIRED, not cosmetic: vitest.config.ts
+      # enables coverage by default with 80/80/75/80 thresholds computed over
+      # the whole of src, so running any subset of the suite fails on
+      # THRESHOLDS rather than on a real defect. The repo's own `test:ci`
+      # script exists to zero those thresholds; this is the same escape hatch,
+      # spelled explicitly. The unit suite is hermetic: NODE_DB_PATH=:memory:
+      # and a mocked API base URL, both from .env.test.
+      - name: Unit tests
+        env:
+          FEATURE_TEST_COVERAGE: 'false'
+        run: npm run test:unit
+
+      # Advisory, mirroring the archetype's default dependency_audit_level.
+      # Emits ONE greppable line so the debt is visible and can later be
+      # ratcheted to blocking. `|| true` applies ONLY to the findings; a
+      # genuinely broken audit still surfaces in the log above it.
+      - name: Dependency audit (advisory)
+        if: always()
+        run: |
+          set -o pipefail
+          npm audit --json > /tmp/audit.json 2>/dev/null || true
+          node -e '
+            let v={};
+            try { v = JSON.parse(require("fs").readFileSync("/tmp/audit.json","utf8")).metadata.vulnerabilities || {}; }
+            catch (e) { console.log("DEPENDENCY_AUDIT_FINDINGS repo=n8n-mcp status=unparseable"); process.exit(0); }
+            const t=(v.critical||0)+(v.high||0)+(v.moderate||0)+(v.low||0);
+            console.log(`DEPENDENCY_AUDIT_FINDINGS repo=n8n-mcp level=advisory critical=${v.critical||0} high=${v.high||0} moderate=${v.moderate||0} low=${v.low||0} total=${t}`);
+            if (t>0) console.log(`::warning::${t} dependency finding(s) — advisory only, NOT blocking.`);
+          '
