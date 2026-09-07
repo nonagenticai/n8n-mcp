@@ -1,0 +1,100 @@
+# CI for n8n-mcp.
+#
+# Before this file the repo had NO workflow files at all — `.github/` held only
+# ABOUT.md, FUNDING.yml, gh-pages.yml and secret_scanning.yml, and
+# `GET /repos/nonagenticai/n8n-mcp/contents/.github/workflows` returned 404.
+# The only thing evaluating a push was the org-level secret scan. Two older
+# Docker workflows (`docker-build-n8n.yml`, "Build and Push Docker Images")
+# survive in the Actions UI as `completed/failure` against long-dead SHAs; their
+# files are gone. Net effect: `chore(deps): bump @types/node to 26` (#7) merged
+# to main with literally nothing compiling it.
+#
+# Consumes the shared ts-service archetype rather than a hand-rolled pipeline
+# (house rule: hand-rolled non-archetype workflows are tech debt). The repo fits
+# the archetype cleanly: npm, a tracked root `package-lock.json`, a real `build`
+# script, and a real test suite. Notes on the inputs, so the next reader does not
+# have to re-derive them:
+#
+# - node_version: 24. The repo pins no Node anywhere — no `engines`, no `.nvmrc`
+#   — so there is nothing to contradict. 24 is the archetype's documented floor
+#   and 20 is end-of-life. It also will not need moving again soon: devDeps
+#   already carry `@types/node ^26` and `typescript ^6`, so 24 is the lowest
+#   version consistent with where this repo's toolchain already is.
+#   ⚠️ Known, deliberate gap: `Dockerfile` still builds on node:22-alpine. That
+#   image is NOT exercised here (see docker_build below), so CI and the container
+#   are on different majors. Raising a deploy-facing base image is a separate
+#   decision and is out of scope for a PR whose job is to add a gate.
+#
+# - No image_name / docker_build. There IS a Dockerfile, so this is a choice, not
+#   an absence. n8n-mcp has NO deployment target in gitops-production — a
+#   recursive tree of that repo matches zero paths for "n8n-mcp", so there is no
+#   Deployment, no ImagePolicy and no Flux rollout to drive. Building and pushing
+#   to registry.internal:5000 would burn the heavy dind pool producing an image
+#   with no consumer, which is roughly what the two deleted Docker workflows were
+#   doing when they went red. Leaving both inputs at their defaults ('' / false)
+#   skips the docker build, smoke, push and rollout steps and keeps build-test on
+#   the light pool. ⚠️ Consequence to state plainly: this gate does NOT prove the
+#   Dockerfile still builds. If n8n-mcp ever gets a cluster deployment, set
+#   image_name + docker_build: true and wire deploy_namespace.
+#
+# - allow_no_tests is deliberately NOT set. This repo has 216 test files; opting
+#   out of the archetype's "the test gate actually ran" assertion would restore
+#   exactly the silent-green behaviour that assertion exists to catch.
+#
+# - test_command. The archetype would otherwise run `npm test`, which is bare
+#   `vitest`, and vitest.config.ts sets NO include/exclude — so the default run
+#   sweeps tests/unit AND tests/integration AND tests/e2e. Only 10 of the 57
+#   integration/e2e files carry a skip guard; the rest expect a live n8n API
+#   (tests/integration/n8n-api/*) and would fail on a hermetic runner. Those
+#   suites already have their own vitest.config.integration.ts and are simply not
+#   CI-ready today — that is a pre-existing condition this PR does not pretend to
+#   fix. So the gate runs the 153-file unit suite, which is hermetic
+#   (NODE_DB_PATH=:memory:, mocked API base URL from .env.test).
+#   FEATURE_TEST_COVERAGE=false is required, not cosmetic: vitest.config.ts
+#   enables coverage by default with 80/80/75/80 thresholds computed over the
+#   whole of src, so running any subset of the suite fails on thresholds rather
+#   than on a real defect. The repo's own `test:ci` script exists to zero those
+#   thresholds; this is the same escape hatch, spelled explicitly.
+#   ⚠️ Scope this gate honestly: it covers unit tests only.
+#
+# - test_timeout_minutes: 30. vitest.config.ts runs singleThread unless
+#   TEST_PARALLEL=true and retries failures twice; 153 files can outrun the
+#   archetype's 25m default. Not raising TEST_PARALLEL here on purpose — that
+#   changes test semantics, which is not this PR's job.
+#
+# - dependency_audit_level left at the default 'advisory'. The audit still runs
+#   and still fails if it cannot RUN; only findings are downgraded to warnings.
+#   Flipping this repo to blocking is the intended later ratchet, once the
+#   reported counts are known and cleaned.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    # DENYLIST, deliberately not an allowlist. `paths-ignore` skips a run only
+    # for a change that is entirely documentation; anything unrecognised —
+    # including a source directory nobody has thought of yet — still runs.
+    #
+    # An allowlist (`paths:`) fails SILENT: add a new source dir, forget to list
+    # it, and CI simply stops triggering. "No CI ran" and "CI passed" render
+    # identically on a PR, so the regression ships green.
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+  workflow_dispatch:
+
+jobs:
+  ci:
+    uses: nonagenticai/gitops-production/.github/workflows/ts-service.yml@main
+    with:
+      node_version: "24"
+      test_command: "FEATURE_TEST_COVERAGE=false npm run test:unit"
+      test_timeout_minutes: 30
+    secrets: inherit

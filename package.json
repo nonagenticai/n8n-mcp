@@ -44,6 +44,7 @@
     "test:e2e": "vitest run tests/e2e",
     "lint": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
+    "ci:verify": "npm run typecheck",
     "update:n8n": "node scripts/update-n8n-deps.js",
     "update:n8n:check": "node scripts/update-n8n-deps.js --dry-run",
     "fetch:templates": "node dist/scripts/fetch-templates.js",
