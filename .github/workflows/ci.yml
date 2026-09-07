@@ -116,8 +116,27 @@ jobs:
 
       # `npm ci` (not `npm install`) — fails if package.json and the lockfile
       # disagree, and never mutates the lockfile.
+      #
+      # Retried up to 3x with backoff. This is NOT papering over a real failure:
+      # run 34092126256 died on `npm error code ECONNRESET / network read` while
+      # the byte-identical lockfile had installed cleanly in 34091521825 minutes
+      # earlier. This dependency tree is large (n8n, n8n-core, n8n-workflow,
+      # @n8n/n8n-nodes-langchain), so a single registry read reset is a routine
+      # event, and an install that flakes trains people to ignore a red gate.
+      # ⚠️ Bounded on purpose: after 3 attempts it FAILS. A genuine lockfile
+      # mismatch or a missing package fails identically on all three and still
+      # reds the job — only transient transport errors are absorbed.
       - name: Install dependencies
-        run: npm ci
+        run: |
+          for attempt in 1 2 3; do
+            echo "::group::npm ci (attempt ${attempt}/3)"
+            if npm ci; then echo "::endgroup::"; exit 0; fi
+            echo "::endgroup::"
+            echo "::warning::npm ci attempt ${attempt}/3 failed"
+            [ "$attempt" -lt 3 ] && sleep $((attempt * 15))
+          done
+          echo "::error::npm ci failed after 3 attempts"
+          exit 1
 
       # Unconditional and direct. The shared archetype gates this behind a probe
       # for a `ci:verify` script and prints "no ci:verify script — skipping"
