@@ -10,7 +10,7 @@
  *
  * Environment variables:
  *   N8N_MCP_LLM_BASE_URL  - LLM server URL (default: http://localhost:1234/v1)
- *   N8N_MCP_LLM_MODEL     - LLM model name (default: qwen3-4b-thinking-2507)
+ *   N8N_MCP_LLM_MODEL     - LLM model name (default: local-llm)
  *   N8N_MCP_LLM_TIMEOUT   - Request timeout in ms (default: 60000)
  *   N8N_MCP_DB_PATH       - Database path (default: ./data/nodes.db)
  */
@@ -80,7 +80,7 @@ Options:
 
 Environment Variables:
   N8N_MCP_LLM_BASE_URL    LLM server URL (default: http://localhost:1234/v1)
-  N8N_MCP_LLM_MODEL       LLM model name (default: qwen3-4b-thinking-2507)
+  N8N_MCP_LLM_MODEL       LLM model name (default: local-llm)
   N8N_MCP_LLM_TIMEOUT     Request timeout in ms (default: 60000)
   N8N_MCP_DB_PATH         Database path (default: ./data/nodes.db)
 
@@ -141,7 +141,7 @@ async function main(): Promise<void> {
   // Show configuration
   console.log('\nConfiguration:');
   console.log(`  LLM Base URL: ${process.env.N8N_MCP_LLM_BASE_URL || 'http://localhost:1234/v1'}`);
-  console.log(`  LLM Model: ${process.env.N8N_MCP_LLM_MODEL || 'qwen3-4b-thinking-2507'}`);
+  console.log(`  LLM Model: ${process.env.N8N_MCP_LLM_MODEL || 'local-llm'}`);
   console.log(`  README concurrency: ${options.readmeConcurrency || 5}`);
   console.log(`  LLM concurrency: ${options.llmConcurrency || 3}`);
   if (options.limit) console.log(`  Limit: ${options.limit} nodes`);
