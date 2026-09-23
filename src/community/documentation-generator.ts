@@ -49,7 +49,7 @@ export interface DocumentationResult {
 export interface DocumentationGeneratorConfig {
   /** Base URL for the LLM server (e.g., http://localhost:1234/v1) */
   baseUrl: string;
-  /** Model name to use (default: qwen3-4b-thinking-2507) */
+  /** Model name to use (default: local-llm) */
   model?: string;
   /** API key (default: 'not-needed' for local servers) */
   apiKey?: string;
@@ -63,7 +63,7 @@ export interface DocumentationGeneratorConfig {
  * Default configuration
  */
 const DEFAULT_CONFIG: Required<Omit<DocumentationGeneratorConfig, 'baseUrl'>> = {
-  model: 'qwen3-4b-thinking-2507',
+  model: 'local-llm',
   apiKey: 'not-needed',
   timeout: 60000,
   maxTokens: 2000,
@@ -351,7 +351,7 @@ Guidelines:
  */
 export function createDocumentationGenerator(): DocumentationGenerator {
   const baseUrl = process.env.N8N_MCP_LLM_BASE_URL || 'http://localhost:1234/v1';
-  const model = process.env.N8N_MCP_LLM_MODEL || 'qwen3-4b-thinking-2507';
+  const model = process.env.N8N_MCP_LLM_MODEL || 'local-llm';
   const timeout = parseInt(process.env.N8N_MCP_LLM_TIMEOUT || '60000', 10);
 
   return new DocumentationGenerator({

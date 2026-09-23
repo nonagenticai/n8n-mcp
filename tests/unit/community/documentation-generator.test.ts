@@ -106,7 +106,7 @@ describe('DocumentationGenerator', () => {
 
       const minimalGenerator = new DocumentationGenerator(minimalConfig);
 
-      expect(minimalGenerator['model']).toBe('qwen3-4b-thinking-2507');
+      expect(minimalGenerator['model']).toBe('local-llm');
       expect(minimalGenerator['maxTokens']).toBe(2000);
       expect(minimalGenerator['timeout']).toBe(60000);
     });
@@ -811,7 +811,7 @@ describe('DocumentationGenerator', () => {
 
       const factoryGenerator = createDocumentationGenerator();
 
-      expect(factoryGenerator['model']).toBe('qwen3-4b-thinking-2507');
+      expect(factoryGenerator['model']).toBe('local-llm');
       expect(factoryGenerator['timeout']).toBe(60000);
     });
   });
