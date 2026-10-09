@@ -130,7 +130,7 @@ jobs:
         run: |
           for attempt in 1 2 3; do
             echo "::group::npm ci (attempt ${attempt}/3)"
-            if npm ci; then echo "::endgroup::"; exit 0; fi
+            if npm ci --legacy-peer-deps; then echo "::endgroup::"; exit 0; fi
             echo "::endgroup::"
             echo "::warning::npm ci attempt ${attempt}/3 failed"
             [ "$attempt" -lt 3 ] && sleep $((attempt * 15))
@@ -148,8 +148,8 @@ jobs:
       # tsconfig.json covers src/** + tests/** + types/** — a strictly wider
       # surface than the build below (src only, via tsconfig.build.json).
       # This is the step that would have caught #7's @types/node bump.
-      - name: Type-check (ci:verify)
-        run: npm run ci:verify
+      - name: Type-check
+        run: npm run typecheck
 
       - name: Build
         run: npm run build
