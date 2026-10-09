@@ -3,6 +3,7 @@ import { WorkflowVersioningService, type WorkflowVersion, type BackupResult } fr
 import { NodeRepository } from '@/database/node-repository';
 import { N8nApiClient } from '@/services/n8n-api-client';
 import { WorkflowValidator } from '@/services/workflow-validator';
+import { N8nApiError } from '@/utils/n8n-errors';
 import type { Workflow } from '@/types/n8n-api';
 
 vi.mock('@/database/node-repository');
@@ -115,7 +116,7 @@ describe('WorkflowVersioningService', () => {
         trigger: 'partial_update'
       });
 
-      expect(mockRepository.pruneWorkflowVersions).toHaveBeenCalledWith('workflow-1', 10);
+      expect(mockRepository.pruneWorkflowVersions).toHaveBeenCalledWith('workflow-1', 10, '');
       expect(result.pruned).toBe(3);
       expect(result.message).toContain('pruned 3 old version(s)');
     });
@@ -170,7 +171,7 @@ describe('WorkflowVersioningService', () => {
 
       await service.getVersionHistory('workflow-1', 5);
 
-      expect(mockRepository.getWorkflowVersions).toHaveBeenCalledWith('workflow-1', 5);
+      expect(mockRepository.getWorkflowVersions).toHaveBeenCalledWith('workflow-1', '', 5);
     });
   });
 
@@ -225,7 +226,7 @@ describe('WorkflowVersioningService', () => {
 
       const result = await service.restoreVersion('workflow-1', undefined, false);
 
-      expect(mockRepository.getLatestWorkflowVersion).toHaveBeenCalledWith('workflow-1');
+      expect(mockRepository.getLatestWorkflowVersion).toHaveBeenCalledWith('workflow-1', '');
       expect(result.success).toBe(true);
     });
 
@@ -326,7 +327,13 @@ describe('WorkflowVersioningService', () => {
 
       const result = await service.restoreVersion('workflow-1', 1, false);
 
-      expect(mockApiClient.updateWorkflow).toHaveBeenCalledWith('workflow-1', versionToRestore.workflowSnapshot);
+      // The write options carry a warning channel: a snapshot can predate a node deletion, and any
+      // canvas group adjusted to make the restore land has to reach the caller.
+      expect(mockApiClient.updateWorkflow).toHaveBeenCalledWith(
+        'workflow-1',
+        versionToRestore.workflowSnapshot,
+        expect.objectContaining({ onWarning: expect.any(Function) })
+      );
       expect(result.success).toBe(true);
       expect(result.message).toContain('Successfully restored workflow to version 1');
       expect(result.fromVersion).toBe(3);
@@ -349,17 +356,48 @@ describe('WorkflowVersioningService', () => {
       expect(result.backupCreated).toBe(true);
       expect(result.backupVersionId).toBe(2);
     });
+
+    it('should report a draft-not-published outcome when n8n refuses to publish the restore (#1118)', async () => {
+      const version = createMockVersion(1);
+      vi.spyOn(mockRepository, 'getWorkflowVersion').mockReturnValue(version);
+      vi.spyOn(mockRepository, 'getWorkflowVersions').mockReturnValue([]);
+      vi.spyOn(mockRepository, 'createWorkflowVersion').mockReturnValue(2);
+      vi.spyOn(mockRepository, 'pruneWorkflowVersions').mockReturnValue(0);
+      vi.spyOn(mockApiClient, 'getWorkflow').mockResolvedValue(createMockWorkflow('workflow-1', 'Current'));
+      vi.spyOn(mockApiClient, 'updateWorkflow').mockRejectedValue(
+        new N8nApiError(
+          "Your change was saved as a draft. It wasn't published because this API key does not have the workflow:activate scope.",
+          403,
+          'PUBLISH_FORBIDDEN',
+          { reason: 'insufficient_api_key_scope', versionId: 'draft-1' },
+        )
+      );
+
+      const result = await service.restoreVersion('workflow-1', 1, false);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('saved as a draft but not published');
+      expect(result.message).toContain('insufficient_api_key_scope');
+      expect(result.message).toContain('published version is unchanged');
+      expect(result.message).toContain('publishing it completes the restore');
+      expect(result.backupCreated).toBe(true);
+      expect(result.backupVersionId).toBe(2);
+      // Machine-readable code and the draft's versionId must survive alongside the
+      // human-readable message, so callers can branch without parsing it.
+      expect(result.code).toBe('PUBLISH_FORBIDDEN');
+      expect(result.draftVersionId).toBe('draft-1');
+    });
   });
 
   describe('deleteVersion', () => {
     it('should delete a specific version', async () => {
       const version = createMockVersion(1);
       vi.spyOn(mockRepository, 'getWorkflowVersion').mockReturnValue(version);
-      vi.spyOn(mockRepository, 'deleteWorkflowVersion').mockReturnValue(undefined);
+      vi.spyOn(mockRepository, 'deleteWorkflowVersion').mockReturnValue(1);
 
       const result = await service.deleteVersion(1);
 
-      expect(mockRepository.deleteWorkflowVersion).toHaveBeenCalledWith(1);
+      expect(mockRepository.deleteWorkflowVersion).toHaveBeenCalledWith(1, '');
       expect(result.success).toBe(true);
       expect(result.message).toContain('Deleted version 1');
     });
@@ -412,25 +450,38 @@ describe('WorkflowVersioningService', () => {
 
       await service.pruneVersions('workflow-1', 5);
 
-      expect(mockRepository.pruneWorkflowVersions).toHaveBeenCalledWith('workflow-1', 5);
+      expect(mockRepository.pruneWorkflowVersions).toHaveBeenCalledWith('workflow-1', 5, '');
     });
   });
 
-  describe('truncateAllVersions', () => {
-    it('should refuse to truncate without confirmation', async () => {
-      const result = await service.truncateAllVersions(false);
+  describe('tenant scoping (GHSA-j6r7-6fhx-77wx)', () => {
+    it('passes the configured instance scope to every repository call', async () => {
+      const scoped = new WorkflowVersioningService(mockRepository, mockApiClient, 'tenant-a');
+      const workflow = createMockWorkflow('workflow-1', 'Test Workflow');
 
-      expect(result.deleted).toBe(0);
-      expect(result.message).toContain('not confirmed');
-    });
+      vi.spyOn(mockRepository, 'getWorkflowVersions').mockReturnValue([]);
+      vi.spyOn(mockRepository, 'createWorkflowVersion').mockReturnValue(1);
+      vi.spyOn(mockRepository, 'pruneWorkflowVersions').mockReturnValue(0);
+      vi.spyOn(mockRepository, 'getWorkflowVersion').mockReturnValue(null);
+      vi.spyOn(mockRepository, 'getWorkflowVersionCount').mockReturnValue(0);
+      vi.spyOn(mockRepository, 'deleteWorkflowVersionsByWorkflowId').mockReturnValue(0);
+      vi.spyOn(mockRepository, 'getVersionStorageStats').mockReturnValue({ totalVersions: 0, totalSize: 0, byWorkflow: [] });
 
-    it('should truncate all versions when confirmed', async () => {
-      vi.spyOn(mockRepository, 'truncateWorkflowVersions').mockReturnValue(50);
+      await scoped.createBackup('workflow-1', workflow, { trigger: 'partial_update' });
+      await scoped.getVersionHistory('workflow-1', 5);
+      await scoped.getVersion(42);
+      await scoped.deleteAllVersions('workflow-1');
+      await scoped.getStorageStats();
 
-      const result = await service.truncateAllVersions(true);
-
-      expect(result.deleted).toBe(50);
-      expect(result.message).toContain('Truncated workflow_versions table');
+      expect(mockRepository.getWorkflowVersions).toHaveBeenCalledWith('workflow-1', 'tenant-a', 1);
+      expect(mockRepository.createWorkflowVersion).toHaveBeenCalledWith(
+        expect.objectContaining({ instanceId: 'tenant-a' })
+      );
+      expect(mockRepository.pruneWorkflowVersions).toHaveBeenCalledWith('workflow-1', 10, 'tenant-a');
+      expect(mockRepository.getWorkflowVersions).toHaveBeenCalledWith('workflow-1', 'tenant-a', 5);
+      expect(mockRepository.getWorkflowVersion).toHaveBeenCalledWith(42, 'tenant-a');
+      expect(mockRepository.getWorkflowVersionCount).toHaveBeenCalledWith('workflow-1', 'tenant-a');
+      expect(mockRepository.getVersionStorageStats).toHaveBeenCalledWith('tenant-a');
     });
   });
 
@@ -490,7 +541,7 @@ describe('WorkflowVersioningService', () => {
         .mockReturnValueOnce(v1)
         .mockReturnValueOnce(v2);
 
-      const result = await service.compareVersions(1, 2);
+      const result = await service.compareVersions(1, 2, 'workflow-1');
 
       expect(result.addedNodes).toEqual(['node-2']);
       expect(result.removedNodes).toEqual([]);
@@ -511,7 +562,7 @@ describe('WorkflowVersioningService', () => {
         .mockReturnValueOnce(v1)
         .mockReturnValueOnce(v2);
 
-      const result = await service.compareVersions(1, 2);
+      const result = await service.compareVersions(1, 2, 'workflow-1');
 
       expect(result.removedNodes).toEqual(['node-2']);
       expect(result.addedNodes).toEqual([]);
@@ -528,7 +579,7 @@ describe('WorkflowVersioningService', () => {
         .mockReturnValueOnce(v1)
         .mockReturnValueOnce(v2);
 
-      const result = await service.compareVersions(1, 2);
+      const result = await service.compareVersions(1, 2, 'workflow-1');
 
       expect(result.modifiedNodes).toEqual(['node-1']);
     });
@@ -544,7 +595,7 @@ describe('WorkflowVersioningService', () => {
         .mockReturnValueOnce(v1)
         .mockReturnValueOnce(v2);
 
-      const result = await service.compareVersions(1, 2);
+      const result = await service.compareVersions(1, 2, 'workflow-1');
 
       expect(result.connectionChanges).toBe(1);
     });
@@ -560,7 +611,7 @@ describe('WorkflowVersioningService', () => {
         .mockReturnValueOnce(v1)
         .mockReturnValueOnce(v2);
 
-      const result = await service.compareVersions(1, 2);
+      const result = await service.compareVersions(1, 2, 'workflow-1');
 
       expect(result.settingChanges).toHaveProperty('executionOrder');
       expect(result.settingChanges.executionOrder.before).toBe('v0');
@@ -570,7 +621,35 @@ describe('WorkflowVersioningService', () => {
     it('should throw error if version not found', async () => {
       vi.spyOn(mockRepository, 'getWorkflowVersion').mockReturnValue(null);
 
-      await expect(service.compareVersions(1, 2)).rejects.toThrow('One or both versions not found');
+      await expect(service.compareVersions(1, 2, 'workflow-1')).rejects.toThrow('One or both versions not found');
+    });
+
+    it('should refuse a version that belongs to another workflow', async () => {
+      const v1 = createMockVersion(1);
+      const v2 = createMockVersion(2);
+      v2.workflowId = 'workflow-2';
+
+      vi.spyOn(mockRepository, 'getWorkflowVersion')
+        .mockReturnValueOnce(v1)
+        .mockReturnValueOnce(v2);
+
+      await expect(service.compareVersions(1, 2, 'workflow-1')).rejects.toThrow(
+        'Version 2 does not belong to workflow workflow-1'
+      );
+    });
+
+    it('should compare versions that both belong to the requested workflow', async () => {
+      const v1 = createMockVersion(1);
+      const v2 = createMockVersion(2);
+
+      vi.spyOn(mockRepository, 'getWorkflowVersion')
+        .mockReturnValueOnce(v1)
+        .mockReturnValueOnce(v2);
+
+      const result = await service.compareVersions(1, 2, 'workflow-1');
+
+      expect(result.versionId1).toBe(1);
+      expect(result.versionId2).toBe(2);
     });
   });
 

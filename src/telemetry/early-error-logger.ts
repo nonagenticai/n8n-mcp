@@ -1,16 +1,16 @@
 /**
  * Early Error Logger (v2.18.3)
  * Captures errors that occur BEFORE the main telemetry system is ready
- * Uses direct Supabase insert to bypass batching and ensure immediate persistence
+ * Uses a direct ingest-client insert to bypass batching and ensure immediate persistence
  *
  * CRITICAL FIXES:
  * - Singleton pattern to prevent multiple instances
  * - Defensive initialization (safe defaults before any throwing operation)
- * - Timeout wrapper for Supabase operations (5s max)
+ * - Timeout wrapper for ingest operations (5s max)
  * - Shared sanitization utilities (DRY principle)
  */
 
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { IngestClient } from './ingest-client';
 import { TelemetryConfigManager } from './config-manager';
 import { TELEMETRY_BACKEND } from './telemetry-types';
 import { StartupCheckpoint, isValidCheckpoint, getCheckpointDescription } from './startup-checkpoints';
@@ -19,18 +19,28 @@ import { logger } from '../utils/logger';
 
 /**
  * Timeout wrapper for async operations
- * Prevents hanging if Supabase is unreachable
+ * Prevents hanging if the ingest backend is unreachable
  */
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operation: string): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
   try {
     const timeoutPromise = new Promise<T>((_, reject) => {
-      setTimeout(() => reject(new Error(`${operation} timeout after ${timeoutMs}ms`)), timeoutMs);
+      timer = setTimeout(
+        () => reject(new Error(`${operation} timeout after ${timeoutMs}ms`)),
+        timeoutMs
+      );
+      timer.unref?.();
     });
 
     return await Promise.race([promise, timeoutPromise]);
   } catch (error) {
     logger.debug(`${operation} failed or timed out:`, error);
     return null;
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
   }
 }
 
@@ -41,7 +51,7 @@ export class EarlyErrorLogger {
   // DEFENSIVE INITIALIZATION: Initialize all fields to safe defaults FIRST
   // This ensures the object is in a valid state even if initialization fails
   private enabled: boolean = false;  // Safe default: disabled
-  private supabase: SupabaseClient | null = null;  // Safe default: null
+  private ingestClient: IngestClient | null = null;  // Safe default: null
   private userId: string | null = null;  // Safe default: null
   private checkpoints: StartupCheckpoint[] = [];
   private startTime: number = Date.now();
@@ -74,7 +84,7 @@ export class EarlyErrorLogger {
   private async initialize(): Promise<void> {
     try {
       // Validate backend configuration before using
-      if (!TELEMETRY_BACKEND.URL || !TELEMETRY_BACKEND.ANON_KEY) {
+      if (!TELEMETRY_BACKEND.URL || !TELEMETRY_BACKEND.KEY) {
         logger.debug('Telemetry backend not configured, early error logger disabled');
         this.enabled = false;
         return;
@@ -90,17 +100,28 @@ export class EarlyErrorLogger {
         return;
       }
 
-      // Initialize Supabase client for direct inserts
-      this.supabase = createClient(
-        TELEMETRY_BACKEND.URL,
-        TELEMETRY_BACKEND.ANON_KEY,
-        {
-          auth: {
-            persistSession: false,
-            autoRefreshToken: false,
-          },
-        }
-      );
+      // Initialize the ingest client for direct inserts
+      const url = process.env.N8N_MCP_TELEMETRY_URL || TELEMETRY_BACKEND.URL;
+      const key = process.env.N8N_MCP_TELEMETRY_KEY || TELEMETRY_BACKEND.KEY;
+      const version = configManager.getPackageVersion();
+      this.ingestClient = new IngestClient({
+        url,
+        key,
+        version,
+        onControl: (signal) => {
+          if (signal.kind === 'disable_version') {
+            // Persist so telemetry (and this logger) stays off across
+            // restarts until an upgrade past this version — same contract
+            // as the main telemetry manager's server-disable handling.
+            configManager.recordServerDisable(version);
+          }
+          // Either signal means: stop sending for the rest of this process.
+          // The ingest client itself already latches and drops further
+          // sends, so this just short-circuits logCheckpoint/logStartupError
+          // without waiting on a doomed request.
+          this.enabled = false;
+        },
+      });
 
       // Get user ID from config manager
       this.userId = configManager.getUserId();
@@ -113,7 +134,7 @@ export class EarlyErrorLogger {
       // Initialization failed - ensure safe state
       logger.debug('Early error logger initialization failed:', error);
       this.enabled = false;
-      this.supabase = null;
+      this.ingestClient = null;
       this.userId = null;
     }
   }
@@ -158,7 +179,7 @@ export class EarlyErrorLogger {
    * FIRE-AND-FORGET: Does not block caller
    */
   logStartupError(checkpoint: StartupCheckpoint, error: unknown): void {
-    if (!this.enabled || !this.supabase || !this.userId) {
+    if (!this.enabled || !this.ingestClient || !this.userId) {
       return;
     }
 
@@ -216,18 +237,16 @@ export class EarlyErrorLogger {
         created_at: new Date().toISOString(),
       };
 
-      // Direct insert to Supabase with timeout (5s max)
+      // Direct insert to the ingest API with timeout (5s max)
       const insertOperation = async () => {
-        return await this.supabase!
-          .from('events')
-          .insert(event)
-          .select()
-          .single();
+        return await this.ingestClient!
+          .from('telemetry_events')
+          .insert(event);
       };
 
       const result = await withTimeout(insertOperation(), 5000, 'Startup error insert');
 
-      if (result && 'error' in result && result.error) {
+      if (result?.error) {
         logger.debug('Failed to insert startup error event:', result.error);
       } else if (result) {
         logger.debug(`Startup error logged for checkpoint: ${checkpoint}`);
@@ -293,6 +312,6 @@ export class EarlyErrorLogger {
    * Check if early logger is enabled
    */
   isEnabled(): boolean {
-    return this.enabled && this.supabase !== null && this.userId !== null;
+    return this.enabled && this.ingestClient !== null && this.userId !== null;
   }
 }

@@ -1,8 +1,18 @@
 # syntax=docker/dockerfile:1.7
 # Ultra-optimized Dockerfile - minimal runtime dependencies (no n8n packages)
 
-# Stage 1: Builder (TypeScript compilation only)
-FROM registry.internal:5000/library/node:22-alpine AS builder
+# Build the self-contained UI assets independently of server dependencies.
+FROM node:22-alpine AS ui-builder
+WORKDIR /app/ui-apps
+COPY ui-apps/package.json ui-apps/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
+COPY ui-apps/tsconfig.json ui-apps/vite.config.ts ./
+COPY ui-apps/src/apps ./src/apps
+COPY ui-apps/src/shared ./src/shared
+RUN npm run build
+
+# Server builder (TypeScript compilation only)
+FROM node:22-alpine AS builder
 WORKDIR /app
 
 # Copy tsconfig files for TypeScript compilation
@@ -10,12 +20,26 @@ COPY tsconfig*.json ./
 
 # Create minimal package.json and install ONLY build dependencies
 # Note: openai and zod are needed for TypeScript compilation of template metadata modules
+#
+# These versions must match package.json. scripts/update-n8n-deps.js re-syncs them
+# on every n8n update. Two ways this list bites when it drifts: a stale n8n-workflow
+# compiles src against older type definitions (a range would resolve through the
+# `latest` dist-tag, which lags the release n8n ships), and a stale zod fails
+# `npm install` outright, because n8n-workflow declares an exact zod peer dependency.
+# Any new direct runtime dependency imported by src/ (e.g. undici) must also be added
+# here, or tsc fails with TS2307 because the scratch package.json never installed it.
+#
+# The overrides mirror package.json. isolated-vm is a native module pulled in through
+# n8n-workflow (@n8n/expression-runtime); it is never used here, and from 7.x it ships
+# no prebuilt binary for Node 22, so without the stub npm tries to compile it and fails
+# on this image (no Python or build tools).
 RUN --mount=type=cache,target=/root/.npm \
-    echo '{}' > package.json && \
+    echo '{"overrides":{"isolated-vm":"npm:empty-npm-package@1.0.0"}}' > package.json && \
     npm install --no-save typescript@^5.8.3 @types/node@^22.15.30 @types/express@^5.0.3 \
-        @modelcontextprotocol/sdk@1.20.1 dotenv@^16.5.0 express@^5.1.0 axios@^1.10.0 \
-        n8n-workflow@^1.96.0 uuid@^11.0.5 @types/uuid@^10.0.0 \
-        openai@^4.77.0 zod@3.24.1 lru-cache@^11.2.1 @supabase/supabase-js@^2.57.4
+        @modelcontextprotocol/sdk@1.30.0 dotenv@^16.5.0 express@^5.1.0 axios@^1.18.1 \
+        n8n-workflow@2.41.2 uuid@^11.1.1 @types/uuid@^10.0.0 \
+        openai@^4.77.0 zod@3.25.76 lru-cache@^11.2.1 \
+        undici@^6.28.0
 
 # Copy source and build
 COPY src ./src
@@ -24,7 +48,7 @@ COPY src ./src
 RUN npx tsc -p tsconfig.build.json
 
 # Stage 2: Runtime (minimal dependencies)
-FROM registry.internal:5000/library/node:22-alpine AS runtime
+FROM node:22-alpine AS runtime
 WORKDIR /app
 
 # Install only essential runtime tools
@@ -44,10 +68,18 @@ RUN --mount=type=cache,target=/root/.npm \
 
 # Copy built application
 COPY --from=builder /app/dist ./dist
+COPY --from=ui-builder /app/ui-apps/dist ./ui-apps/dist
+RUN --mount=type=bind,source=scripts/ui-package-smoke.cjs,target=/tmp/ui-package-smoke.cjs \
+    node /tmp/ui-package-smoke.cjs /app
 
 # Copy pre-built database and required files
 # Cache bust: 2025-07-06-trigger-fix-v3 - includes is_trigger=true for webhook,cron,interval,emailReadImap
 COPY data/nodes.db ./data/
+# Pristine seed copy outside /app/data: volume mounts over /app/data mask the
+# bundled database, and the runtime image cannot rebuild it (no n8n packages),
+# so the entrypoint seeds custom/empty DB paths from here.
+COPY data/nodes.db ./.db-seed/nodes.db
+COPY data/skills ./data/skills
 COPY src/database/schema-optimized.sql ./src/database/
 COPY .env.example ./
 

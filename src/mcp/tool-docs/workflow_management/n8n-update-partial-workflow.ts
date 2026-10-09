@@ -4,7 +4,7 @@ export const n8nUpdatePartialWorkflowDoc: ToolDocumentation = {
   name: 'n8n_update_partial_workflow',
   category: 'workflow_management',
   essentials: {
-    description: 'Update workflow incrementally with diff operations. Types: addNode, removeNode, updateNode, moveNode, enable/disableNode, addConnection, removeConnection, rewireConnection, cleanStaleConnections, replaceConnections, updateSettings, updateName, add/removeTag, activateWorkflow, deactivateWorkflow. Supports smart parameters (branch, case) for multi-output nodes. Full support for AI connections (ai_languageModel, ai_tool, ai_memory, ai_embedding, ai_vectorStore, ai_document, ai_textSplitter, ai_outputParser).',
+    description: 'Update workflow incrementally with diff operations. Types: addNode, removeNode, updateNode, patchNodeField, moveNode, enable/disableNode, addConnection, removeConnection, rewireConnection, cleanStaleConnections, replaceConnections, updateSettings, updateName, setNodeGroups, add/removeTag, activateWorkflow, deactivateWorkflow, transferWorkflow, moveToFolder. Supports smart parameters (branch, case) for multi-output nodes. Full support for AI connections (ai_languageModel, ai_tool, ai_memory, ai_embedding, ai_vectorStore, ai_document, ai_textSplitter, ai_outputParser).',
     keyParameters: ['id', 'operations', 'continueOnError'],
     example: 'n8n_update_partial_workflow({id: "wf_123", operations: [{type: "rewireConnection", source: "IF", from: "Old", to: "New", branch: "true"}]})',
     performance: 'Fast (50-200ms)',
@@ -22,18 +22,22 @@ export const n8nUpdatePartialWorkflowDoc: ToolDocumentation = {
       'Batch AI component connections for atomic updates',
       'Auto-sanitization: ALL nodes auto-fixed during updates (operator structures, missing metadata)',
       'Node renames automatically update all connection references - no manual connection operations needed',
-      'Activate/deactivate workflows: Use activateWorkflow/deactivateWorkflow operations (requires activatable triggers like webhook/schedule)'
+      'Activate/deactivate workflows: Use activateWorkflow/deactivateWorkflow operations (requires activatable triggers like webhook/schedule)',
+      'Transfer workflows between projects: Use transferWorkflow with destinationProjectId (enterprise feature)',
+      'Canvas groups survive edits automatically: members removed by a diff are pruned, and a group n8n can no longer accept is ungrouped with a warning (nodes and connections are never changed)',
+      'Use setNodeGroups to create or replace canvas groups (n8n 2.28+); it replaces the whole list, so pass every group you want to keep'
     ]
   },
   full: {
-    description: `Updates workflows using surgical diff operations instead of full replacement. Supports 17 operation types for precise modifications. Operations are validated and applied atomically by default - all succeed or none are applied.
+    description: `Updates workflows using surgical diff operations instead of full replacement. Supports 20 operation types for precise modifications. Operations are validated and applied atomically by default - all succeed or none are applied.
 
 ## Available Operations:
 
-### Node Operations (6 types):
-- **addNode**: Add a new node with name, type, and position (required)
+### Node Operations (7 types):
+- **addNode**: Add a new node with name and type (required). Position is required too, unless a later operation in the same request supplies it - e.g. addNode followed by moveNode
 - **removeNode**: Remove a node by ID or name
 - **updateNode**: Update node properties using dot notation (e.g., 'parameters.url')
+- **patchNodeField**: Surgically edit string fields using find/replace patches. Strict mode: errors if find string not found, errors if multiple matches (ambiguity) unless replaceAll is set. Supports replaceAll and regex flags.
 - **moveNode**: Change node position [x, y]
 - **enableNode**: Enable a disabled node
 - **disableNode**: Disable an active node
@@ -45,15 +49,27 @@ export const n8nUpdatePartialWorkflowDoc: ToolDocumentation = {
 - **cleanStaleConnections**: Auto-remove all connections referencing non-existent nodes
 - **replaceConnections**: Replace entire connections object
 
-### Metadata Operations (4 types):
-- **updateSettings**: Modify workflow settings
+### Metadata Operations (5 types):
+- **updateSettings**: Modify workflow settings (merged over the current ones). Any key the n8n Public API accepts is forwarded, e.g. \`availableInMCP: true\` exposes the workflow to n8n's instance-level MCP server.
 - **updateName**: Rename the workflow
+- **setNodeGroups**: Replace the workflow's canvas groups (n8n 2.28+). Full replacement — pass every group to keep, or \`[]\` to ungroup everything. Each group takes \`name\` plus either \`nodeNames\` or \`nodeIds\`, and an optional \`description\` (max 155 chars, n8n 2.32+; dropped automatically on older instances). Group members must form a connected run with no trigger among them; n8n validates that on save and its message is returned unchanged if a group you asked for is rejected.
 - **addTag**: Add a workflow tag
 - **removeTag**: Remove a workflow tag
+
+### Canvas groups on every update
+
+n8n validates canvas groups on every write, including writes that have nothing to do with grouping. Groups are therefore reconciled automatically: members a diff deleted are pruned, a group left with no members is removed, and a group n8n refuses is ungrouped so the edit still lands. Every adjustment appears in \`details.warnings\`; nodes and connections are never altered to save a group.
 
 ### Workflow Activation Operations (2 types):
 - **activateWorkflow**: Activate the workflow to enable automatic execution via triggers
 - **deactivateWorkflow**: Deactivate the workflow to prevent automatic execution
+
+n8n 2.33 renamed this to publish/unpublish - what the editor calls "Publish" is what these
+operations do, on every supported version. The operation names are unchanged.
+
+### Project Management Operations (2 types):
+- **transferWorkflow**: Transfer the workflow to a different project. Requires \`destinationProjectId\`. Enterprise/cloud feature.
+- **moveToFolder**: Move the workflow into a folder (n8n 2.32+). Requires \`parentFolderId\`: a folder ID, or null for the project root. The placement is write-only in n8n's API - it cannot be read back, so verify in the n8n UI if needed. Manage folders with n8n_manage_folders. When combined with transferWorkflow in one request, the folder move applies in the SOURCE project before the transfer runs - use a separate moveToFolder call after the transfer instead.
 
 ## Smart Parameters for Multi-Output Nodes
 
@@ -115,8 +131,8 @@ When ANY workflow update is made, ALL nodes in the workflow are automatically sa
 
 1. **Operator Structure Fixes**:
    - Binary operators (equals, contains, greaterThan, etc.) automatically have \`singleValue\` removed
-   - Unary operators (isEmpty, isNotEmpty, true, false) automatically get \`singleValue: true\` added
-   - Invalid operator structures (e.g., \`{type: "isNotEmpty"}\`) are corrected to \`{type: "boolean", operation: "isNotEmpty"}\`
+   - Unary operators (empty, notEmpty, true, false) automatically get \`singleValue: true\` added
+   - Invalid operator structures (e.g., \`{type: "notEmpty"}\`) are corrected to \`{type: "object", operation: "notEmpty"}\`
 
 2. **Missing Metadata Added**:
    - IF nodes with conditions get complete \`conditions.options\` structure if missing
@@ -194,12 +210,12 @@ Please choose a different name.
 - Can rename a node and add/remove connections using the new name in the same batch
 - Use \`validateOnly: true\` to preview effects before applying
 
-## Removing Properties with undefined
+## Removing Properties with null
 
-To remove a property from a node, set its value to \`undefined\` in the updates object. This is essential when migrating from deprecated properties or cleaning up optional configuration fields.
+To remove a property from a node, set its value to \`null\` in the updates object. This is essential when migrating from deprecated properties or cleaning up optional configuration fields. Over the MCP/JSON-RPC API always use \`null\` — an \`undefined\` value is dropped by JSON serialization before it reaches the server, so it would be a silent no-op. (Internally, in-process callers such as the workflow auto-fixer may pass \`undefined\`, which the diff engine now treats the same as \`null\`.)
 
-### Why Use undefined?
-- **Property removal vs. null**: Setting a property to \`undefined\` removes it completely from the node object, while \`null\` sets the property to a null value
+### Why Use null?
+- **Property removal**: Setting a property to \`null\` removes it completely from the node object
 - **Validation constraints**: Some properties are mutually exclusive (e.g., \`continueOnFail\` and \`onError\`). Simply setting one without removing the other will fail validation
 - **Deprecated property migration**: When n8n deprecates properties, you must remove the old property before the new one will work
 
@@ -211,7 +227,7 @@ n8n_update_partial_workflow({
   operations: [{
     type: "updateNode",
     nodeName: "HTTP Request",
-    updates: { onError: undefined }
+    updates: { onError: null }
   }]
 });
 
@@ -221,7 +237,7 @@ n8n_update_partial_workflow({
   operations: [{
     type: "updateNode",
     nodeId: "node_abc",
-    updates: { disabled: undefined }
+    updates: { disabled: null }
   }]
 });
 \`\`\`
@@ -235,7 +251,7 @@ n8n_update_partial_workflow({
   operations: [{
     type: "updateNode",
     nodeName: "API Request",
-    updates: { "parameters.authentication": undefined }
+    updates: { "parameters.authentication": null }
   }]
 });
 
@@ -245,7 +261,22 @@ n8n_update_partial_workflow({
   operations: [{
     type: "updateNode",
     nodeName: "HTTP Request",
-    updates: { "parameters.headers": undefined }
+    updates: { "parameters.headers": null }
+  }]
+});
+
+// Remove single array elements: the array is spliced, so later elements shift
+// down. Several removals on the same array in one updates object are applied
+// from the highest index down, so the indices you pass are the ones you see.
+n8n_update_partial_workflow({
+  id: "wf_345",
+  operations: [{
+    type: "updateNode",
+    nodeName: "Edit Fields",
+    updates: {
+      "parameters.assignments.assignments[0]": null,
+      "parameters.assignments.assignments[1]": null
+    }
   }]
 });
 \`\`\`
@@ -271,7 +302,7 @@ n8n_update_partial_workflow({
     type: "updateNode",
     nodeName: "HTTP Request",
     updates: {
-      continueOnFail: undefined,
+      continueOnFail: null,
       onError: "continueErrorOutput"
     }
   }]
@@ -287,15 +318,15 @@ n8n_update_partial_workflow({
     type: "updateNode",
     nodeName: "Data Processor",
     updates: {
-      continueOnFail: undefined,
-      alwaysOutputData: undefined,
-      "parameters.legacy_option": undefined
+      continueOnFail: null,
+      alwaysOutputData: null,
+      "parameters.legacy_option": null
     }
   }]
 });
 \`\`\`
 
-### When to Use undefined
+### When to Use null
 - Removing deprecated properties during migration
 - Cleaning up optional configuration flags
 - Resolving mutual exclusivity validation errors
@@ -329,6 +360,13 @@ n8n_update_partial_workflow({
       '// Best-effort mode: apply what works, report what fails\nn8n_update_partial_workflow({id: "vwx", operations: [\n  {type: "updateName", name: "Fixed Workflow"},\n  {type: "removeConnection", source: "Broken", target: "Node"},\n  {type: "cleanStaleConnections"}\n], continueOnError: true})',
       '// Update node parameter\nn8n_update_partial_workflow({id: "yza", operations: [{type: "updateNode", nodeName: "HTTP Request", updates: {"parameters.url": "https://api.example.com"}}]})',
       '// Validate before applying\nn8n_update_partial_workflow({id: "bcd", operations: [{type: "removeNode", nodeName: "Old Process"}], validateOnly: true})',
+      '// Surgically edit code using __patch_find_replace (avoids replacing entire code block)\nn8n_update_partial_workflow({id: "pfr1", operations: [{type: "updateNode", nodeName: "Code", updates: {"parameters.jsCode": {"__patch_find_replace": [{"find": "const limit = 10;", "replace": "const limit = 50;"}]}}}]})',
+      '// Multiple sequential patches on the same property\nn8n_update_partial_workflow({id: "pfr2", operations: [{type: "updateNode", nodeName: "Code", updates: {"parameters.jsCode": {"__patch_find_replace": [{"find": "api.old-domain.com", "replace": "api.new-domain.com"}, {"find": "Authorization: Bearer old_token", "replace": "Authorization: Bearer new_token"}]}}}]})',
+      '\n// ============ PATCHNODEFIELD EXAMPLES (strict find/replace) ============',
+      '// Surgical code edit with patchNodeField (errors if not found)\nn8n_update_partial_workflow({id: "pnf1", operations: [{type: "patchNodeField", nodeName: "Code", fieldPath: "parameters.jsCode", patches: [{find: "const limit = 10;", replace: "const limit = 50;"}]}]})',
+      '// Replace all occurrences of a string\nn8n_update_partial_workflow({id: "pnf2", operations: [{type: "patchNodeField", nodeName: "Code", fieldPath: "parameters.jsCode", patches: [{find: "api.old.com", replace: "api.new.com", replaceAll: true}]}]})',
+      '// Multiple sequential patches\nn8n_update_partial_workflow({id: "pnf3", operations: [{type: "patchNodeField", nodeName: "Set Email", fieldPath: "parameters.assignments.assignments.6.value", patches: [{find: "© 2025 n8n-mcp", replace: "© 2026 n8n-mcp"}, {find: "<p>Unsubscribe</p>", replace: ""}]}]})',
+      '// Regex-based replacement\nn8n_update_partial_workflow({id: "pnf4", operations: [{type: "patchNodeField", nodeName: "Code", fieldPath: "parameters.jsCode", patches: [{find: "const\\\\s+limit\\\\s*=\\\\s*\\\\d+", replace: "const limit = 100", regex: true}]}]})',
       '\n// ============ AI CONNECTION EXAMPLES ============',
       '// Connect language model to AI Agent\nn8n_update_partial_workflow({id: "ai1", operations: [{type: "addConnection", source: "OpenAI Chat Model", target: "AI Agent", sourceOutput: "ai_languageModel"}]})',
       '// Connect tool to AI Agent\nn8n_update_partial_workflow({id: "ai2", operations: [{type: "addConnection", source: "HTTP Request Tool", target: "AI Agent", sourceOutput: "ai_tool"}]})',
@@ -341,11 +379,16 @@ n8n_update_partial_workflow({
       '// Rewire AI Agent to use different language model\nn8n_update_partial_workflow({id: "ai9", operations: [{type: "rewireConnection", source: "AI Agent", from: "OpenAI Chat Model", to: "Anthropic Chat Model", sourceOutput: "ai_languageModel"}]})',
       '// Replace all AI tools for an agent\nn8n_update_partial_workflow({id: "ai10", operations: [\n  {type: "removeConnection", source: "Old Tool 1", target: "AI Agent", sourceOutput: "ai_tool"},\n  {type: "removeConnection", source: "Old Tool 2", target: "AI Agent", sourceOutput: "ai_tool"},\n  {type: "addConnection", source: "New HTTP Tool", target: "AI Agent", sourceOutput: "ai_tool"},\n  {type: "addConnection", source: "New Code Tool", target: "AI Agent", sourceOutput: "ai_tool"}\n]})',
       '\n// ============ REMOVING PROPERTIES EXAMPLES ============',
-      '// Remove a simple property\nn8n_update_partial_workflow({id: "rm1", operations: [{type: "updateNode", nodeName: "HTTP Request", updates: {onError: undefined}}]})',
-      '// Migrate from deprecated continueOnFail to onError\nn8n_update_partial_workflow({id: "rm2", operations: [{type: "updateNode", nodeName: "HTTP Request", updates: {continueOnFail: undefined, onError: "continueErrorOutput"}}]})',
-      '// Remove nested property\nn8n_update_partial_workflow({id: "rm3", operations: [{type: "updateNode", nodeName: "API Request", updates: {"parameters.authentication": undefined}}]})',
-      '// Remove multiple properties\nn8n_update_partial_workflow({id: "rm4", operations: [{type: "updateNode", nodeName: "Data Processor", updates: {continueOnFail: undefined, alwaysOutputData: undefined, "parameters.legacy_option": undefined}}]})',
-      '// Remove entire array property\nn8n_update_partial_workflow({id: "rm5", operations: [{type: "updateNode", nodeName: "HTTP Request", updates: {"parameters.headers": undefined}}]})'
+      '// Remove a simple property\nn8n_update_partial_workflow({id: "rm1", operations: [{type: "updateNode", nodeName: "HTTP Request", updates: {onError: null}}]})',
+      '// Migrate from deprecated continueOnFail to onError\nn8n_update_partial_workflow({id: "rm2", operations: [{type: "updateNode", nodeName: "HTTP Request", updates: {continueOnFail: null, onError: "continueErrorOutput"}}]})',
+      '// Remove nested property\nn8n_update_partial_workflow({id: "rm3", operations: [{type: "updateNode", nodeName: "API Request", updates: {"parameters.authentication": null}}]})',
+      '// Remove multiple properties\nn8n_update_partial_workflow({id: "rm4", operations: [{type: "updateNode", nodeName: "Data Processor", updates: {continueOnFail: null, alwaysOutputData: null, "parameters.legacy_option": null}}]})',
+      '// Remove entire array property\nn8n_update_partial_workflow({id: "rm5", operations: [{type: "updateNode", nodeName: "HTTP Request", updates: {"parameters.headers": null}}]})',
+      '\n// ============ PROJECT TRANSFER EXAMPLES ============',
+      '// Transfer workflow to a different project\nn8n_update_partial_workflow({id: "tf1", operations: [{type: "transferWorkflow", destinationProjectId: "project-abc-123"}]})',
+      '// Transfer and activate in one call\nn8n_update_partial_workflow({id: "tf2", operations: [{type: "transferWorkflow", destinationProjectId: "project-abc-123"}, {type: "activateWorkflow"}]})',
+      '// Move workflow into a folder (n8n 2.32+)\nn8n_update_partial_workflow({id: "mf1", operations: [{type: "moveToFolder", parentFolderId: "folder-abc-123"}]})',
+      '// Move workflow back to the project root\nn8n_update_partial_workflow({id: "mf2", operations: [{type: "moveToFolder", parentFolderId: null}]})'
     ],
     useCases: [
       'Rewire connections when replacing nodes',
@@ -363,7 +406,11 @@ n8n_update_partial_workflow({
       'Add fallback language models to AI Agents',
       'Configure Vector Store retrieval systems',
       'Swap language models in existing AI workflows',
-      'Batch-update AI tool connections'
+      'Batch-update AI tool connections',
+      'Transfer workflows between team projects (enterprise)',
+      'Surgical string edits in email templates, code, or JSON bodies (patchNodeField)',
+      'Fix typos or update URLs in large HTML content without re-transmitting the full string',
+      'Bulk find/replace across node field content (replaceAll flag)'
     ],
     performance: 'Very fast - typically 50-200ms. Much faster than full updates as only changes are processed.',
     bestPractices: [
@@ -383,10 +430,13 @@ n8n_update_partial_workflow({
       'Use targetIndex for fallback models (primary=0, fallback=1)',
       'Batch AI component connections in a single operation for atomicity',
       'Validate AI workflows after connection changes to catch configuration errors',
-      'To remove properties, set them to undefined (not null) in the updates object',
+      'To remove properties, set them to null in the updates object',
       'When migrating from deprecated properties, remove the old property and add the new one in the same operation',
-      'Use undefined to resolve mutual exclusivity validation errors between properties',
-      'Batch multiple property removals in a single updateNode operation for efficiency'
+      'Use null to resolve mutual exclusivity validation errors between properties',
+      'Batch multiple property removals in a single updateNode operation for efficiency',
+      'Prefer patchNodeField over __patch_find_replace for strict error handling — patchNodeField errors on not-found and detects ambiguous matches',
+      'Use replaceAll: true in patchNodeField when you want to replace all occurrences of a string',
+      'Use regex: true in patchNodeField for pattern-based replacements (e.g., whitespace-insensitive matching)'
     ],
     pitfalls: [
       '**REQUIRES N8N_API_URL and N8N_API_KEY environment variables** - will not work without n8n API access',
@@ -403,15 +453,23 @@ n8n_update_partial_workflow({
       '**CRITICAL**: For Switch nodes, ALWAYS use case=N instead of sourceIndex. Using same sourceIndex for multiple connections will put them on the same case output.',
       'cleanStaleConnections removes ALL broken connections - cannot be selective',
       'replaceConnections overwrites entire connections object - all previous connections lost',
-      '**Auto-sanitization behavior**: Binary operators (equals, contains) automatically have singleValue removed; unary operators (isEmpty, isNotEmpty) automatically get singleValue:true added',
+      '**Auto-sanitization behavior**: Binary operators (equals, contains) automatically have singleValue removed; unary operators (empty, notEmpty) automatically get singleValue:true added',
       '**Auto-sanitization runs on ALL nodes**: When ANY update is made, ALL nodes in the workflow are sanitized (not just modified ones)',
       '**Auto-sanitization cannot fix everything**: It fixes operator structures and missing metadata, but cannot fix broken connections or branch mismatches',
       '**Corrupted workflows beyond repair**: Workflows in paradoxical states (API returns corrupt, API rejects updates) cannot be fixed via API - must be recreated',
-      'Setting a property to null does NOT remove it - use undefined instead',
-      'When properties are mutually exclusive (e.g., continueOnFail and onError), setting only the new property will fail - you must remove the old one with undefined',
+      '**__patch_find_replace for code edits**: Instead of replacing entire code blocks, use `{"parameters.jsCode": {"__patch_find_replace": [{"find": "old text", "replace": "new text"}]}}` to surgically edit string properties',
+      '__patch_find_replace replaces the FIRST occurrence of each find string. Patches are applied sequentially — order matters',
+      '**patchNodeField is strict**: it ERRORS if the find string is not found (unlike __patch_find_replace which only warns)',
+      '**patchNodeField detects ambiguity**: if find matches multiple times, it ERRORS unless replaceAll: true is set',
+      'When using regex: true in patchNodeField, escape special regex characters (., *, +, etc.) if you want literal matching',
+      'patchNodeField literal mode (regex not set) inserts replace verbatim, so $ needs no escaping. With regex: true, replace supports JS replacement patterns: $1 for a capture group, $$ for a literal $',
+      'Patches to parameters.jsCode or parameters.functionCode are parsed as JavaScript after applying: a patch that breaks previously-valid code fails the operation. Only the final result of one operation\'s patches array is checked, so apply dependent edits in a single operation. A leading = is stripped before parsing, matching how n8n runs these noDataExpression fields. Fields that were already invalid before patching and pythonCode are not checked; code over 1MB is never parsed, and patching valid code into something unverifiable is rejected — set the full value via updateNode (unchecked) if that is intended. The parse runs on the MCP server\'s Node.js: in the rare case it rejects newer syntax your n8n runtime accepts, set the full field value via updateNode instead (not guarded)',
+      'To remove a property, set it to null in the updates object',
+      'When properties are mutually exclusive (e.g., continueOnFail and onError), setting only the new property will fail - you must remove the old one with null',
       'Removing a required property may cause validation errors - check node documentation first',
       'Nested property removal with dot notation only removes the specific nested field, not the entire parent object',
-      'Array index notation (e.g., "parameters.headers[0]") is not supported - remove the entire array property instead'
+      'Array elements are addressed by index in bracket or dot form (e.g., "parameters.assignments.assignments[0].value" or "parameters.assignments.assignments.0.value") - out-of-range indices are rejected, so new elements cannot be appended this way',
+      '**code: "PUBLISH_FORBIDDEN"** (n8n 2.39+): the API key or user may edit a published workflow but not publish it. n8n rejects the save with 403 and this tool decides what to do by content, not by n8n\'s reported version (2.39 does not bump versionId for name/settings-only changes): a rollback is attempted only when the content on the server no longer matches what was there before. There are five outcomes: (1) version and content both unchanged after the 403 - n8n reports a draft was saved, but nothing on the server shows it, so nothing is rolled back and the outcome is reported as unconfirmed: details.rollbackPerformed=false, details.draftVersionId names the draft n8n reported; (2) rolled back - a rollback was attempted and the draft now matches the content from before this update, details.rollbackPerformed=true, details.supersededDraftVersionId names the draft the restore replaced; (3) change retained - the rollback failed and a read-back confirms the attempted change is still there, details.rollbackPerformed=false, details.changeRetained=true, details.draftVersionId names the current draft; (4) restore incomplete - the rollback failed and the read-back matches neither the attempted change nor the prior content, details.rollbackPerformed=false, details.observedDraftVersionId names what was actually found; (5) unconfirmed (read-back failed) - the rollback failed and the read-back itself failed too, details.rollbackPerformed=false, details.attemptedDraftVersionId names the draft n8n first reported (which the rollback attempt may since have superseded - it is NOT necessarily current). Outcomes (1) and (5) are both reported as "unconfirmed" but are distinguishable: (1) never attempted a rollback at all (no second PUT), while (5) did attempt one and only the verification read-back failed. details.rollbackVerifiedAfterError is set only when outcome (2) was confirmed by a read-back after the rollback PUT itself errored (a rollback PUT that returns 200 is just as clean but won\'t set it). A folder move cannot be rolled back or reliably ruled out (parentFolderId is write-only) - when the request moved the workflow, details.folderMoveMayHavePersisted flags that uncertainty regardless of which of the five outcomes applies. Retrying with the same credentials will not publish - the API key needs the workflow:activate scope and the user needs workflow:publish permission on the workflow'
     ],
     relatedTools: ['n8n_update_full_workflow', 'n8n_get_workflow', 'validate_workflow', 'tools_documentation']
   }

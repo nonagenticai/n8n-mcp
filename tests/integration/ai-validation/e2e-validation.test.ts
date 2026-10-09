@@ -9,7 +9,6 @@ import { describe, it, expect, beforeEach, afterEach, afterAll } from 'vitest';
 import { createTestContext, TestContext, createTestWorkflowName } from '../n8n-api/utils/test-context';
 import { getTestN8nClient } from '../n8n-api/utils/n8n-client';
 import { N8nApiClient } from '../../../src/services/n8n-api-client';
-import { cleanupOrphanedWorkflows } from '../n8n-api/utils/cleanup-helpers';
 import { createMcpContext } from '../n8n-api/utils/mcp-context';
 import { InstanceContext } from '../../../src/types/instance-context';
 import { handleValidateWorkflow, handleCreateWorkflow } from '../../../src/mcp/handlers-n8n-manager';
@@ -49,9 +48,6 @@ describe('Integration: End-to-End AI Workflow Validation', () => {
 
   afterAll(async () => {
     await closeNodeRepository();
-    if (!process.env.CI) {
-      await cleanupOrphanedWorkflows();
-    }
   });
 
   // ======================================================================
@@ -214,9 +210,12 @@ describe('Integration: End-to-End AI Workflow Validation', () => {
 
     expect(errorCodes).toContain('MISSING_LANGUAGE_MODEL'); // AI Agent
     expect(errorCodes).toContain('MISSING_PROMPT_TEXT'); // AI Agent
-    expect(errorCodes).toContain('MISSING_TOOL_DESCRIPTION'); // HTTP Tool
     expect(errorCodes).toContain('MISSING_URL'); // HTTP Tool
     expect(errorCodes).toContain('MISSING_CODE'); // Code Tool
+
+    // Missing toolDescription on HTTP Tool is a warning (n8n runs the tool without it)
+    const warningCodes = (validationData.warnings ?? []).map(w => w.details?.code || w.code);
+    expect(warningCodes).toContain('MISSING_TOOL_DESCRIPTION'); // HTTP Tool
 
     // Should also have streaming error
     const streamingErrors = validationData.errors!.filter(e => {

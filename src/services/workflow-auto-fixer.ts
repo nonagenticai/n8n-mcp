@@ -5,14 +5,15 @@
  * Converts validation results into diff operations that can be applied to fix the workflow.
  */
 
-import crypto from 'crypto';
-import { WorkflowValidationResult } from './workflow-validator';
+import { v5 as uuidv5 } from 'uuid';
+import { WorkflowValidationResult, VALID_CONNECTION_TYPES } from './workflow-validator';
 import { ExpressionFormatIssue } from './expression-format-validator';
 import { NodeSimilarityService } from './node-similarity-service';
 import { NodeRepository } from '../database/node-repository';
 import {
   WorkflowDiffOperation,
-  UpdateNodeOperation
+  UpdateNodeOperation,
+  ReplaceConnectionsOperation
 } from '../types/workflow-diff';
 import { WorkflowNode, Workflow } from '../types/n8n-api';
 import { Logger } from '../utils/logger';
@@ -30,9 +31,22 @@ export type FixType =
   | 'error-output-config'
   | 'node-type-correction'
   | 'webhook-missing-path'
-  | 'typeversion-upgrade'     // Proactive version upgrades
-  | 'version-migration'       // Smart version migrations with breaking changes
-  | 'tool-variant-correction'; // Fix base nodes used as AI tools when Tool variant exists
+  | 'typeversion-upgrade'           // Proactive version upgrades
+  | 'version-migration'             // Smart version migrations with breaking changes
+  | 'tool-variant-correction'       // Fix base nodes used as AI tools when Tool variant exists
+  | 'connection-numeric-keys'       // "0","1" keys → main[0], main[1]
+  | 'connection-invalid-type'       // type:"0" → type:"main"
+  | 'connection-id-to-name'         // node ID refs → node name refs
+  | 'connection-duplicate-removal'  // Dedup identical connection entries
+  | 'connection-input-index';       // Out-of-bounds input index → clamped
+
+export const CONNECTION_FIX_TYPES: FixType[] = [
+  'connection-numeric-keys',
+  'connection-invalid-type',
+  'connection-id-to-name',
+  'connection-duplicate-removal',
+  'connection-input-index'
+];
 
 export interface AutoFixConfig {
   applyFixes: boolean;
@@ -157,7 +171,7 @@ export class WorkflowAutoFixer {
 
     // Process webhook path fixes (HIGH confidence)
     if (!fullConfig.fixTypes || fullConfig.fixTypes.includes('webhook-missing-path')) {
-      this.processWebhookPathFixes(validationResult, nodeMap, operations, fixes);
+      this.processWebhookPathFixes(validationResult, nodeMap, operations, fixes, workflow);
     }
 
     // Process tool variant corrections (HIGH confidence)
@@ -174,6 +188,9 @@ export class WorkflowAutoFixer {
     if (!fullConfig.fixTypes || fullConfig.fixTypes.includes('version-migration')) {
       await this.processVersionMigrationFixes(workflow, nodeMap, operations, fixes, postUpdateGuidance);
     }
+
+    // Process connection structure fixes (HIGH/MEDIUM confidence)
+    this.processConnectionFixes(workflow, validationResult, fullConfig, operations, fixes);
 
     // Filter by confidence threshold
     const filteredFixes = this.filterByConfidence(fixes, fullConfig.confidenceThreshold);
@@ -404,13 +421,31 @@ export class WorkflowAutoFixer {
   }
 
   /**
+   * Namespace UUID for webhook ID derivation. Any fixed v4 UUID works — it
+   * just needs to be stable across releases so derived IDs don't shift.
+   */
+  private static readonly WEBHOOK_ID_NAMESPACE = '6d8f5c4a-7b1e-4d2f-9a3c-8e5b1d2f6a7c';
+
+  /**
+   * Derive a stable UUID for a webhook's path+webhookId so preview and apply
+   * return the same value (QA #4). Previously `crypto.randomUUID()` was called
+   * in both, producing different UUIDs and breaking any downstream system that
+   * pre-configured against the preview.
+   */
+  private deriveStableWebhookId(workflowId: string | undefined, nodeId: string): string {
+    const seed = `${workflowId ?? 'new'}::${nodeId}`;
+    return uuidv5(seed, WorkflowAutoFixer.WEBHOOK_ID_NAMESPACE);
+  }
+
+  /**
    * Process webhook path fixes for webhook nodes missing path parameter
    */
   private processWebhookPathFixes(
     validationResult: WorkflowValidationResult,
     nodeMap: Map<string, WorkflowNode>,
     operations: WorkflowDiffOperation[],
-    fixes: FixOperation[]
+    fixes: FixOperation[],
+    workflow: Workflow
   ): void {
     for (const error of validationResult.errors) {
       // Check for webhook path required error
@@ -424,8 +459,9 @@ export class WorkflowAutoFixer {
         // Only fix webhook nodes
         if (!node.type?.includes('webhook')) continue;
 
-        // Generate a unique UUID for both path and webhookId
-        const webhookId = crypto.randomUUID();
+        // Derive a stable UUID keyed by workflow+node so preview and apply
+        // return the same value (QA #4).
+        const webhookId = this.deriveStableWebhookId(workflow.id, node.id || nodeName);
 
         // Check if we need to update typeVersion
         const currentTypeVersion = node.typeVersion || 1;
@@ -654,10 +690,16 @@ export class WorkflowAutoFixer {
     filteredFixes: FixOperation[],
     allFixes: FixOperation[]
   ): WorkflowDiffOperation[] {
+    // fixedNodes contains node names (FixOperation.node = node.name)
     const fixedNodes = new Set(filteredFixes.map(f => f.node));
+    const hasConnectionFixes = filteredFixes.some(f => CONNECTION_FIX_TYPES.includes(f.type));
     return operations.filter(op => {
       if (op.type === 'updateNode') {
-        return fixedNodes.has(op.nodeId || '');
+        // Check both nodeName and nodeId — operations may use either
+        return fixedNodes.has(op.nodeName || '') || fixedNodes.has(op.nodeId || '');
+      }
+      if (op.type === 'replaceConnections') {
+        return hasConnectionFixes;
       }
       return true;
     });
@@ -677,7 +719,12 @@ export class WorkflowAutoFixer {
         'webhook-missing-path': 0,
         'typeversion-upgrade': 0,
         'version-migration': 0,
-        'tool-variant-correction': 0
+        'tool-variant-correction': 0,
+        'connection-numeric-keys': 0,
+        'connection-invalid-type': 0,
+        'connection-id-to-name': 0,
+        'connection-duplicate-removal': 0,
+        'connection-input-index': 0
       },
       byConfidence: {
         'high': 0,
@@ -730,11 +777,389 @@ export class WorkflowAutoFixer {
       parts.push(`${stats.byType['tool-variant-correction']} tool variant ${stats.byType['tool-variant-correction'] === 1 ? 'correction' : 'corrections'}`);
     }
 
+    const connectionIssueCount =
+      (stats.byType['connection-numeric-keys'] || 0) +
+      (stats.byType['connection-invalid-type'] || 0) +
+      (stats.byType['connection-id-to-name'] || 0) +
+      (stats.byType['connection-duplicate-removal'] || 0) +
+      (stats.byType['connection-input-index'] || 0);
+    if (connectionIssueCount > 0) {
+      parts.push(`${connectionIssueCount} connection ${connectionIssueCount === 1 ? 'issue' : 'issues'}`);
+    }
+
     if (parts.length === 0) {
       return `Fixed ${stats.total} ${stats.total === 1 ? 'issue' : 'issues'}`;
     }
 
     return `Fixed ${parts.join(', ')}`;
+  }
+
+  /**
+   * Process connection structure fixes.
+   * Deep-clones workflow.connections, applies fixes in order:
+   * numeric keys → ID-to-name → invalid type → input index → dedup
+   * Emits a single ReplaceConnectionsOperation if any corrections were made.
+   */
+  private processConnectionFixes(
+    workflow: Workflow,
+    validationResult: WorkflowValidationResult,
+    config: AutoFixConfig,
+    operations: WorkflowDiffOperation[],
+    fixes: FixOperation[]
+  ): void {
+    if (!workflow.connections || Object.keys(workflow.connections).length === 0) {
+      return;
+    }
+
+    // Build lookup maps
+    const idToNameMap = new Map<string, string>();
+    const nameSet = new Set<string>();
+    for (const node of workflow.nodes) {
+      idToNameMap.set(node.id, node.name);
+      nameSet.add(node.name);
+    }
+
+    // Deep-clone connections
+    const conn: any = JSON.parse(JSON.stringify(workflow.connections));
+    let anyFixed = false;
+
+    // 1. Fix numeric source keys ("0" → main[0])
+    if (!config.fixTypes || config.fixTypes.includes('connection-numeric-keys')) {
+      const numericKeyResult = this.fixNumericKeys(conn);
+      if (numericKeyResult.length > 0) {
+        fixes.push(...numericKeyResult);
+        anyFixed = true;
+      }
+    }
+
+    // 2. Fix ID-to-name references (source keys and .node values)
+    if (!config.fixTypes || config.fixTypes.includes('connection-id-to-name')) {
+      const idToNameResult = this.fixIdToName(conn, idToNameMap, nameSet);
+      if (idToNameResult.length > 0) {
+        fixes.push(...idToNameResult);
+        anyFixed = true;
+      }
+    }
+
+    // 3. Fix invalid connection types
+    if (!config.fixTypes || config.fixTypes.includes('connection-invalid-type')) {
+      const invalidTypeResult = this.fixInvalidTypes(conn);
+      if (invalidTypeResult.length > 0) {
+        fixes.push(...invalidTypeResult);
+        anyFixed = true;
+      }
+    }
+
+    // 4. Fix out-of-bounds input indices
+    if (!config.fixTypes || config.fixTypes.includes('connection-input-index')) {
+      const inputIndexResult = this.fixInputIndices(conn, validationResult, workflow);
+      if (inputIndexResult.length > 0) {
+        fixes.push(...inputIndexResult);
+        anyFixed = true;
+      }
+    }
+
+    // 5. Dedup identical connection entries
+    if (!config.fixTypes || config.fixTypes.includes('connection-duplicate-removal')) {
+      const dedupResult = this.fixDuplicateConnections(conn);
+      if (dedupResult.length > 0) {
+        fixes.push(...dedupResult);
+        anyFixed = true;
+      }
+    }
+
+    if (anyFixed) {
+      const op: ReplaceConnectionsOperation = {
+        type: 'replaceConnections',
+        connections: conn
+      };
+      operations.push(op);
+    }
+  }
+
+  /**
+   * Fix numeric connection output keys ("0", "1" → main[0], main[1])
+   */
+  private fixNumericKeys(conn: any): FixOperation[] {
+    const fixes: FixOperation[] = [];
+    const sourceNodes = Object.keys(conn);
+
+    for (const sourceName of sourceNodes) {
+      const nodeConn = conn[sourceName];
+      const numericKeys = Object.keys(nodeConn).filter(k => /^\d+$/.test(k));
+
+      if (numericKeys.length === 0) continue;
+
+      // Ensure main array exists
+      if (!nodeConn['main']) {
+        nodeConn['main'] = [];
+      }
+
+      for (const numKey of numericKeys) {
+        const index = parseInt(numKey, 10);
+        const entries = nodeConn[numKey];
+
+        // Extend main array if needed (fill gaps with empty arrays)
+        while (nodeConn['main'].length <= index) {
+          nodeConn['main'].push([]);
+        }
+
+        // Merge entries into main[index]
+        // The slot can be a null branch (#1096); spreading one threw
+        // "nodeConn.main[index] is not iterable" out of n8n_autofix_workflow. Merging into it
+        // is the fix it was asked for, so an empty branch is the right starting point.
+        const hadExisting = Array.isArray(nodeConn['main'][index]) && nodeConn['main'][index].length > 0;
+        if (Array.isArray(entries)) {
+          for (const outputGroup of entries) {
+            if (Array.isArray(outputGroup)) {
+              const existing = Array.isArray(nodeConn['main'][index]) ? nodeConn['main'][index] : [];
+              nodeConn['main'][index] = [
+                ...existing,
+                ...outputGroup
+              ];
+            }
+          }
+        }
+
+        if (hadExisting) {
+          logger.warn(`Merged numeric key "${numKey}" into existing main[${index}] on node "${sourceName}" - dedup pass will clean exact duplicates`);
+        }
+
+        fixes.push({
+          node: sourceName,
+          field: `connections.${sourceName}.${numKey}`,
+          type: 'connection-numeric-keys',
+          before: numKey,
+          after: `main[${index}]`,
+          confidence: hadExisting ? 'medium' : 'high',
+          description: hadExisting
+            ? `Merged numeric connection key "${numKey}" into existing main[${index}] on node "${sourceName}"`
+            : `Converted numeric connection key "${numKey}" to main[${index}] on node "${sourceName}"`
+        });
+
+        delete nodeConn[numKey];
+      }
+    }
+
+    return fixes;
+  }
+
+  /**
+   * Fix node ID references in connections (replace IDs with names)
+   */
+  private fixIdToName(
+    conn: any,
+    idToNameMap: Map<string, string>,
+    nameSet: Set<string>
+  ): FixOperation[] {
+    const fixes: FixOperation[] = [];
+
+    // Build rename plan for source keys, then check for collisions
+    const renames: Array<{ oldKey: string; newKey: string }> = [];
+    const sourceKeys = Object.keys(conn);
+    for (const sourceKey of sourceKeys) {
+      if (idToNameMap.has(sourceKey) && !nameSet.has(sourceKey)) {
+        renames.push({ oldKey: sourceKey, newKey: idToNameMap.get(sourceKey)! });
+      }
+    }
+
+    // Check for collisions among renames (two IDs mapping to the same name)
+    const newKeyCount = new Map<string, number>();
+    for (const r of renames) {
+      newKeyCount.set(r.newKey, (newKeyCount.get(r.newKey) || 0) + 1);
+    }
+    const safeRenames = renames.filter(r => {
+      if ((newKeyCount.get(r.newKey) || 0) > 1) {
+        logger.warn(`Skipping ambiguous ID-to-name rename: "${r.oldKey}" → "${r.newKey}" (multiple IDs map to same name)`);
+        return false;
+      }
+      return true;
+    });
+
+    for (const { oldKey, newKey } of safeRenames) {
+      conn[newKey] = conn[oldKey];
+      delete conn[oldKey];
+      fixes.push({
+        node: newKey,
+        field: `connections.sourceKey`,
+        type: 'connection-id-to-name',
+        before: oldKey,
+        after: newKey,
+        confidence: 'high',
+        description: `Replaced node ID "${oldKey}" with name "${newKey}" as connection source key`
+      });
+    }
+
+    // Fix .node values that are node IDs
+    for (const sourceName of Object.keys(conn)) {
+      const nodeConn = conn[sourceName];
+      for (const outputKey of Object.keys(nodeConn)) {
+        const outputs = nodeConn[outputKey];
+        if (!Array.isArray(outputs)) continue;
+        for (const outputGroup of outputs) {
+          if (!Array.isArray(outputGroup)) continue;
+          for (const entry of outputGroup) {
+            if (entry && entry.node && idToNameMap.has(entry.node) && !nameSet.has(entry.node)) {
+              const oldNode = entry.node;
+              const newNode = idToNameMap.get(entry.node)!;
+              entry.node = newNode;
+              fixes.push({
+                node: sourceName,
+                field: `connections.${sourceName}.${outputKey}[].node`,
+                type: 'connection-id-to-name',
+                before: oldNode,
+                after: newNode,
+                confidence: 'high',
+                description: `Replaced target node ID "${oldNode}" with name "${newNode}" in connection from "${sourceName}"`
+              });
+            }
+          }
+        }
+      }
+    }
+
+    return fixes;
+  }
+
+  /**
+   * Fix invalid connection types in entries (e.g., type:"0" → type:"main")
+   */
+  private fixInvalidTypes(conn: any): FixOperation[] {
+    const fixes: FixOperation[] = [];
+
+    for (const sourceName of Object.keys(conn)) {
+      const nodeConn = conn[sourceName];
+      for (const outputKey of Object.keys(nodeConn)) {
+        const outputs = nodeConn[outputKey];
+        if (!Array.isArray(outputs)) continue;
+        for (const outputGroup of outputs) {
+          if (!Array.isArray(outputGroup)) continue;
+          for (const entry of outputGroup) {
+            if (entry && entry.type && !VALID_CONNECTION_TYPES.has(entry.type)) {
+              const oldType = entry.type;
+              // Use the parent output key if it's valid, otherwise default to "main"
+              const newType = VALID_CONNECTION_TYPES.has(outputKey) ? outputKey : 'main';
+              entry.type = newType;
+              fixes.push({
+                node: sourceName,
+                field: `connections.${sourceName}.${outputKey}[].type`,
+                type: 'connection-invalid-type',
+                before: oldType,
+                after: newType,
+                confidence: 'high',
+                description: `Fixed invalid connection type "${oldType}" → "${newType}" in connection from "${sourceName}" to "${entry.node}"`
+              });
+            }
+          }
+        }
+      }
+    }
+
+    return fixes;
+  }
+
+  /**
+   * Fix out-of-bounds input indices (clamp to valid range)
+   */
+  private fixInputIndices(
+    conn: any,
+    validationResult: WorkflowValidationResult,
+    workflow: Workflow
+  ): FixOperation[] {
+    const fixes: FixOperation[] = [];
+
+    // Parse INPUT_INDEX_OUT_OF_BOUNDS errors from validation
+    for (const error of validationResult.errors) {
+      if (error.code !== 'INPUT_INDEX_OUT_OF_BOUNDS') continue;
+
+      const targetNodeName = error.nodeName;
+      if (!targetNodeName) continue;
+
+      // Extract the bad index and input count from the error message
+      const match = error.message.match(/Input index (\d+).*?has (\d+) main input/);
+      if (!match) {
+        logger.warn(`Could not parse INPUT_INDEX_OUT_OF_BOUNDS error for node "${targetNodeName}": ${error.message}`);
+        continue;
+      }
+
+      const badIndex = parseInt(match[1], 10);
+      const inputCount = parseInt(match[2], 10);
+
+      // For multi-input nodes, clamp to max valid index; for single-input, reset to 0
+      const clampedIndex = inputCount > 1 ? Math.min(badIndex, inputCount - 1) : 0;
+
+      // Find and fix the bad index in connections
+      for (const sourceName of Object.keys(conn)) {
+        const nodeConn = conn[sourceName];
+        for (const outputKey of Object.keys(nodeConn)) {
+          const outputs = nodeConn[outputKey];
+          if (!Array.isArray(outputs)) continue;
+          for (const outputGroup of outputs) {
+            if (!Array.isArray(outputGroup)) continue;
+            for (const entry of outputGroup) {
+              if (entry && entry.node === targetNodeName && entry.index === badIndex) {
+                entry.index = clampedIndex;
+                fixes.push({
+                  node: sourceName,
+                  field: `connections.${sourceName}.${outputKey}[].index`,
+                  type: 'connection-input-index',
+                  before: badIndex,
+                  after: clampedIndex,
+                  confidence: 'medium',
+                  description: `Clamped input index ${badIndex} → ${clampedIndex} for target node "${targetNodeName}" (has ${inputCount} input${inputCount === 1 ? '' : 's'})`
+                });
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return fixes;
+  }
+
+  /**
+   * Remove duplicate connection entries (same node, type, index)
+   */
+  private fixDuplicateConnections(conn: any): FixOperation[] {
+    const fixes: FixOperation[] = [];
+
+    for (const sourceName of Object.keys(conn)) {
+      const nodeConn = conn[sourceName];
+      for (const outputKey of Object.keys(nodeConn)) {
+        const outputs = nodeConn[outputKey];
+        if (!Array.isArray(outputs)) continue;
+        for (let i = 0; i < outputs.length; i++) {
+          const outputGroup = outputs[i];
+          if (!Array.isArray(outputGroup)) continue;
+
+          const seen = new Set<string>();
+          const deduped: any[] = [];
+
+          for (const entry of outputGroup) {
+            const key = JSON.stringify({ node: entry.node, type: entry.type, index: entry.index });
+            if (seen.has(key)) {
+              fixes.push({
+                node: sourceName,
+                field: `connections.${sourceName}.${outputKey}[${i}]`,
+                type: 'connection-duplicate-removal',
+                before: entry,
+                after: null,
+                confidence: 'high',
+                description: `Removed duplicate connection from "${sourceName}" to "${entry.node}" (type: ${entry.type}, index: ${entry.index})`
+              });
+            } else {
+              seen.add(key);
+              deduped.push(entry);
+            }
+          }
+
+          outputs[i] = deduped;
+        }
+      }
+    }
+
+    return fixes;
   }
 
   /**
@@ -775,6 +1200,15 @@ export class WorkflowAutoFixer {
           latestVersion
         );
 
+        // Changes the migration could not apply need a person; the
+        // version-migration pass documents them instead of an update.
+        if (!migrationResult.success) {
+          logger.info(`Skipping automatic upgrade for ${node.name}: manual migration steps remain`, {
+            remainingIssues: migrationResult.remainingIssues.length
+          });
+          continue;
+        }
+
         // Create fix operation
         fixes.push({
           node: node.name,
@@ -786,10 +1220,11 @@ export class WorkflowAutoFixer {
           description: `Upgrade ${node.name} from v${currentVersion} to v${latestVersion}. ${analysis.reason}`
         });
 
-        // Create update operation
+        // Create update operation — both nodeId and nodeName needed for fix filtering
         const operation: UpdateNodeOperation = {
           type: 'updateNode',
           nodeId: node.id,
+          nodeName: node.name,
           updates: {
             typeVersion: parseFloat(latestVersion),
             parameters: migrationResult.updatedNode.parameters,

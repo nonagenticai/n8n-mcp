@@ -60,6 +60,7 @@ export N8N_MODE=true
 export MCP_MODE=http                       # Required for HTTP mode
 export N8N_API_URL=http://localhost:5678  # Your n8n instance URL
 export N8N_API_KEY=your-api-key-here       # Your n8n API key
+export WEBHOOK_SECURITY_MODE=moderate      # Required when N8N_API_URL is localhost or RFC1918
 export MCP_AUTH_TOKEN=test-token-minimum-32-chars-long
 export AUTH_TOKEN=test-token-minimum-32-chars-long  # Same value as MCP_AUTH_TOKEN
 export PORT=3001
@@ -86,6 +87,7 @@ curl http://localhost:3001/mcp
 | `MCP_MODE` | Yes | Enables HTTP mode for n8n MCP Client | `http` |
 | `N8N_API_URL` | Yes* | URL of your n8n instance | `http://localhost:5678` |
 | `N8N_API_KEY` | Yes* | n8n API key for workflow management | `n8n_api_xxx...` |
+| `WEBHOOK_SECURITY_MODE` | No | SSRF gate (`strict` default, `moderate`, `permissive`). Set to `moderate` when `N8N_API_URL` is localhost or an RFC1918 host on the same network. | `moderate` |
 | `MCP_AUTH_TOKEN` | Yes | Authentication token for MCP requests (min 32 chars) | `secure-random-32-char-token` |
 | `AUTH_TOKEN` | Yes | **MUST match MCP_AUTH_TOKEN exactly** | `secure-random-32-char-token` |
 | `PORT` | No | Port for the HTTP server | `3000` (default) |
@@ -135,6 +137,7 @@ docker run -d \
   -e MCP_MODE=http \
   -e N8N_API_URL=http://n8n:5678 \
   -e N8N_API_KEY=your-n8n-api-key \
+  -e WEBHOOK_SECURITY_MODE=permissive \
   -e MCP_AUTH_TOKEN=$AUTH_TOKEN \
   -e AUTH_TOKEN=$AUTH_TOKEN \
   -e LOG_LEVEL=info \
@@ -183,6 +186,7 @@ Environment="N8N_MODE=true"
 Environment="MCP_MODE=http"
 Environment="N8N_API_URL=http://localhost:5678"
 Environment="N8N_API_KEY=your-n8n-api-key"
+Environment="WEBHOOK_SECURITY_MODE=moderate"
 Environment="MCP_AUTH_TOKEN=your-secure-token-32-chars-min"
 Environment="AUTH_TOKEN=your-secure-token-32-chars-min"
 Environment="PORT=3000"
@@ -425,26 +429,11 @@ docker compose up -d
    
    ⚠️ **Critical**: The Server URL must include the `/mcp` endpoint path. Without this, the connection will fail.
 
-3. **Test the connection** by selecting a simple tool like `list_nodes`
+3. **Test the connection** by selecting a simple tool like `search_nodes`
 
 ### Available Tools
 
-Once connected, you can use these MCP tools in n8n:
-
-**Documentation Tools** (No API key required):
-- `list_nodes` - List all n8n nodes with filtering
-- `search_nodes` - Search nodes by keyword
-- `get_node_info` - Get detailed node information
-- `get_node_essentials` - Get only essential properties
-- `validate_workflow` - Validate workflow configurations
-- `get_node_documentation` - Get human-readable docs
-
-**Management Tools** (Requires n8n API key):
-- `n8n_create_workflow` - Create new workflows
-- `n8n_update_workflow` - Update existing workflows
-- `n8n_get_workflow` - Retrieve workflow details
-- `n8n_list_workflows` - List all workflows
-- `n8n_trigger_webhook_workflow` - Trigger webhook workflows
+Once connected, you can use these MCP tools in n8n. See the [README's tool table](../README.md#core-tools-7-tools) for the documentation tools (no API key required) and the [n8n Management Tools table](../README.md#n8n-management-tools-21-tools---requires-api-configuration) for the tools that require n8n API key configuration.
 
 ### Using with AI Agents
 
@@ -457,7 +446,7 @@ Connect n8n-MCP to AI Agent nodes for intelligent automation:
 ```
 You are an n8n workflow expert. Use the MCP tools to:
 1. Search for appropriate nodes using search_nodes
-2. Get configuration details with get_node_essentials
+2. Get configuration details with get_node (detail: "standard")
 3. Validate configurations with validate_workflow
 4. Create the workflow if all validations pass
 ```

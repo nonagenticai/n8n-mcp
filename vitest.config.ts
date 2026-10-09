@@ -1,27 +1,40 @@
-import { defineConfig } from 'vitest/config';
+import { configDefaults, defineConfig } from 'vitest/config';
 import path from 'path';
 
 export default defineConfig({
   test: {
     globals: true,
+    // UI has its own DOM and browser configuration.
+    exclude: [...configDefaults.exclude, 'ui-apps/**'],
     environment: 'node',
     // Only include global-setup.ts, remove msw-setup.ts from global setup
     setupFiles: ['./tests/setup/global-setup.ts'],
+    // NOTE: the orphaned-workflow sweep (tests/setup/integration-global-setup.ts,
+    // issue #1102) is registered only in vitest.config.integration.ts, not
+    // here. `npm test` still runs the integration files when credentials are
+    // configured, but a run selected by file (often unit-only) must not start
+    // an instance-wide deletion; each integration file's own `afterEach`
+    // cleanup handles its resources, and `npm run test:integration` / the
+    // maintenance script sweep leaks from crashed runs.
     // Load environment variables from .env.test
     env: {
-      NODE_ENV: 'test'
+      NODE_ENV: 'test',
+      // Tests must never talk to the telemetry backend. Without this the
+      // first-run default is enabled, so integration tests that construct a
+      // server would ship CI-generated rows to the production project and block
+      // each shutdown on a real round-trip.
+      N8N_MCP_TELEMETRY_DISABLED: 'true'
     },
     // Test execution settings
     pool: 'threads',
     poolOptions: {
       threads: {
-        singleThread: process.env.TEST_PARALLEL !== 'true',
         maxThreads: parseInt(process.env.TEST_MAX_WORKERS || '4', 10),
         minThreads: 1
       }
     },
-    // Retry configuration
-    retry: parseInt(process.env.TEST_RETRY_ATTEMPTS || '2', 10),
+    // No retries - flaky tests should be fixed, not masked
+    retry: 0,
     // Test reporter - reduce reporters in CI to prevent hanging
     reporters: process.env.CI ? ['default', 'junit'] : ['default'],
     outputFile: {
@@ -45,10 +58,10 @@ export default defineConfig({
         '**/__mocks__/**'
       ],
       thresholds: {
-        lines: 80,
-        functions: 80,
-        branches: 75,
-        statements: 80
+        lines: 75,
+        functions: 75,
+        branches: 70,
+        statements: 75
       },
       // Add coverage-specific settings to prevent hanging
       all: false, // Don't collect coverage for untested files

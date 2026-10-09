@@ -17,6 +17,9 @@ VERSION=$(node -e "console.log(require('./package.json').version)")
 echo -e "${GREEN}📌 Version: $VERSION${NC}"
 
 # Prepare publish directory
+echo "Building MCP UI assets..."
+npm --prefix ui-apps run build
+
 PUBLISH_DIR="npm-publish-temp"
 rm -rf $PUBLISH_DIR
 mkdir -p $PUBLISH_DIR
@@ -24,6 +27,8 @@ mkdir -p $PUBLISH_DIR
 echo "📦 Copying files..."
 cp -r dist $PUBLISH_DIR/
 cp -r data $PUBLISH_DIR/
+mkdir -p "$PUBLISH_DIR/ui-apps"
+cp -r ui-apps/dist "$PUBLISH_DIR/ui-apps/"
 cp README.md LICENSE .env.example $PUBLISH_DIR/
 cp .npmignore $PUBLISH_DIR/ 2>/dev/null || true
 cp package.runtime.json $PUBLISH_DIR/package.json
@@ -35,17 +40,19 @@ node -e "
 const pkg = require('./package.json');
 pkg.name = 'n8n-mcp';
 pkg.description = 'Integration between n8n workflow automation and Model Context Protocol (MCP)';
-pkg.bin = { 'n8n-mcp': './dist/mcp/index.js' };
+pkg.bin = { 'n8n-mcp': './dist/mcp/stdio-wrapper.js' };
 pkg.repository = { type: 'git', url: 'git+https://github.com/czlonkowski/n8n-mcp.git' };
 pkg.keywords = ['n8n', 'mcp', 'model-context-protocol', 'ai', 'workflow', 'automation'];
 pkg.author = 'Romuald Czlonkowski @ www.aiadvisors.pl/en';
 pkg.license = 'MIT';
 pkg.bugs = { url: 'https://github.com/czlonkowski/n8n-mcp/issues' };
 pkg.homepage = 'https://github.com/czlonkowski/n8n-mcp#readme';
-pkg.files = ['dist/**/*', 'data/nodes.db', '.env.example', 'README.md', 'LICENSE'];
+pkg.files = ['dist/**/*', 'ui-apps/dist/**/*', 'data/nodes.db', '.env.example', 'README.md', 'LICENSE'];
 delete pkg.private;
 require('fs').writeFileSync('./package.json', JSON.stringify(pkg, null, 2));
 "
+
+node ../scripts/ui-package-smoke.cjs "$PWD"
 
 echo ""
 echo "📋 Package details:"

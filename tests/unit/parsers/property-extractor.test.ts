@@ -436,17 +436,101 @@ describe('PropertyExtractor', () => {
       expect(isAITool).toBe(true);
     });
 
-    it('should detect AI capability when node name contains AI-related terms', () => {
-      const aiNodeNames = ['openai', 'anthropic', 'huggingface', 'cohere', 'myai'];
-      
-      aiNodeNames.forEach(name => {
+    it('should detect AI capability when a versioned node instance carries usableAsTool', () => {
+      // VersionedNodeType assigns nodeVersions in its constructor, so the map
+      // only exists on an instance - the class itself exposes nothing.
+      const NodeClass = versionedNodeTypeClassFactory.build({
+        nodeVersions: {
+          1: { description: { usableAsTool: false } },
+          2: { description: { name: 'test', usableAsTool: true } }
+        }
+      });
+
+      const isAITool = extractor.detectAIToolCapability(NodeClass as any);
+
+      expect(isAITool).toBe(true);
+    });
+
+    it('should detect the object form of usableAsTool', () => {
+      // n8n's type is `true | UsableAsToolDescription`. HTTP Request - the most
+      // used tool node there is - carries the object form on every version from
+      // 3 onwards, so an identity check against `true` drops it entirely.
+      const NodeClass = versionedNodeTypeClassFactory.build({
+        baseDescription: { name: 'httpRequest', defaultVersion: 4.4 },
+        nodeVersions: {
+          1: { description: {} },
+          4.4: {
+            description: {
+              name: 'httpRequest',
+              usableAsTool: { replacements: { codex: { subcategories: { Tools: ['Recommended Tools'] } } } }
+            }
+          }
+        }
+      });
+
+      const isAITool = extractor.detectAIToolCapability(NodeClass as any);
+
+      expect(isAITool).toBe(true);
+    });
+
+    it('should read tool capability from the current version, not any version', () => {
+      // n8n resolves nodeVersions[currentVersion] before reading usableAsTool.
+      // A node that dropped tool support in its current version must not be
+      // credited with a tool variant n8n will never create.
+      const NodeClass = versionedNodeTypeClassFactory.build({
+        baseDescription: { name: 'droppedToolSupport', defaultVersion: 2 },
+        nodeVersions: {
+          1: { description: { name: 'droppedToolSupport', usableAsTool: true } },
+          2: { description: { name: 'droppedToolSupport' } }
+        }
+      });
+
+      const isAITool = extractor.detectAIToolCapability(NodeClass as any);
+
+      expect(isAITool).toBe(false);
+    });
+
+    it('should prefer a declared defaultVersion over the highest version key', () => {
+      // n8n resolves defaultVersion, which is not always the newest version -
+      // a node can ship a later version while defaulting to an earlier one.
+      const NodeClass = class {
+        description = { name: 'defaultsToOlder', defaultVersion: 1 };
+        nodeVersions = {
+          1: { description: { name: 'defaultsToOlder', usableAsTool: true } },
+          2: { description: { name: 'defaultsToOlder' } }
+        };
+      };
+
+      const isAITool = extractor.detectAIToolCapability(NodeClass as any);
+
+      expect(isAITool).toBe(true);
+    });
+
+    it('should return false when the node cannot be instantiated', () => {
+      const NodeClass = class {
+        constructor() {
+          throw new Error('Cannot instantiate');
+        }
+      };
+
+      expect(() => extractor.detectAIToolCapability(NodeClass as any)).not.toThrow();
+      expect(extractor.detectAIToolCapability(NodeClass as any)).toBe(false);
+    });
+
+    it('should not infer AI capability from an AI-sounding node name', () => {
+      // n8n exposes a node as a tool only via usableAsTool. Inferring it from
+      // the name invents node types n8n does not have - 'wait' is here because
+      // the removed heuristic matched the 'ai' inside it and produced waitTool.
+      const namesTheRemovedHeuristicMatched = ['openai', 'anthropic', 'huggingface', 'cohere', 'myai', 'wait'];
+
+      namesTheRemovedHeuristicMatched.forEach(name => {
         const NodeClass = nodeClassFactory.build({
           description: { name }
         });
-        
+
         const isAITool = extractor.detectAIToolCapability(NodeClass as any);
-        
-        expect(isAITool).toBe(true);
+
+        expect(isAITool).toBe(false);
       });
     });
 

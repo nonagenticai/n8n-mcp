@@ -8,24 +8,29 @@ import express from 'express';
 import rateLimit from 'express-rate-limit';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
-import { N8NDocumentationMCPServer, SharedResources } from './mcp/server';
+import { N8NDocumentationMCPServer } from './mcp/server';
 import { ConsoleManager } from './utils/console-manager';
 import { logger } from './utils/logger';
-import { AuthManager } from './utils/auth';
+import { redactHeaders, summarizeMcpBody } from './utils/redaction';
+import { AuthManager, buildBearerChallenge } from './utils/auth';
 import { readFileSync } from 'fs';
 import dotenv from 'dotenv';
 import { getStartupBaseUrl, formatEndpointUrls, detectBaseUrl } from './utils/url-detector';
 import { PROJECT_VERSION } from './utils/version';
 import { v4 as uuidv4 } from 'uuid';
-import { createHash } from 'crypto';
+import { createHmac } from 'crypto';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import {
   negotiateProtocolVersion,
   logProtocolNegotiation,
   STANDARD_PROTOCOL_VERSION
 } from './utils/protocol-version';
-import { InstanceContext, validateInstanceContext } from './types/instance-context';
+import { InstanceContext, pickInstanceContextFields, validateInstanceContext } from './types/instance-context';
+import { runWithRequestContext } from './utils/request-context';
 import { SessionState } from './types/session-state';
+import type { AdditionalTool } from './types/additional-tools';
+import { closeSharedDatabase } from './database/shared-database';
+import { clearOfficialMcpClientCache } from './mcp/official-mcp-access';
 
 dotenv.config();
 
@@ -36,6 +41,11 @@ const DEFAULT_PROTOCOL_VERSION = STANDARD_PROTOCOL_VERSION;
 interface MultiTenantHeaders {
   'x-n8n-url'?: string;
   'x-n8n-key'?: string;
+  // MCP access token for n8n's instance-level MCP server (n8n_manage_agents,
+  // n8n_explore_node_resources, the team-project fallback in n8n_list_catalog).
+  // Separate secret from x-n8n-key; the env-level equivalent is
+  // N8N_MCP_ACCESS_TOKEN.
+  'x-n8n-mcp-token'?: string;
   'x-instance-id'?: string;
   'x-session-id'?: string;
 }
@@ -44,13 +54,54 @@ interface MultiTenantHeaders {
 const MAX_SESSIONS = Math.max(1, parseInt(process.env.N8N_MCP_MAX_SESSIONS || '100', 10));
 const SESSION_CLEANUP_INTERVAL = 5 * 60 * 1000; // 5 minutes
 
-interface Session {
-  server: N8NDocumentationMCPServer;
-  transport: StreamableHTTPServerTransport | SSEServerTransport;
-  lastAccess: Date;
-  sessionId: string;
-  initialized: boolean;
-  isSSE: boolean;
+// Interval between SSE keep-alive comment frames on the Streamable HTTP
+// transport's open streams — the legacy SSEServerTransport path below has no
+// equivalent option. The frames are what keep an idle GET stream, or a POST
+// stream held open through a long tool call, from being closed by a reverse
+// proxy or an idle timeout, which reaches the client as
+// `SSE stream disconnected: TypeError: terminated`.
+//
+// 15s is the SDK's own default, set explicitly so the behavior is visible here
+// and does not move with a future change to that default.
+const STREAMABLE_HTTP_KEEP_ALIVE_MS = 15_000;
+
+// The JSON-RPC surface this server implements, as exact method names plus
+// namespace prefixes. Gating on the namespace rather than an exact method list
+// means a method added inside a namespace we already serve keeps reaching the
+// SDK instead of being rejected as unknown while the surface drifts.
+// Namespaces cover every request and notification defined by
+// @modelcontextprotocol/sdk 1.30.0; tests/unit/http-server/method-not-found.test.ts
+// fails if a later SDK introduces one outside them.
+//
+// The cost of that choice: an unregistered method inside an accepted namespace
+// (`tools/not-real`) is admitted rather than answered -32601 here. With a
+// session it still gets -32601, from the SDK's own dispatch; without one it
+// falls through to the session error. No client probes that way — the probe
+// this guard exists for is `server/discover` — and narrowing to an exact list
+// would trade this corner for falsely rejecting the next method the SDK adds.
+const IMPLEMENTED_MCP_METHODS = new Set(['initialize', 'ping']);
+const IMPLEMENTED_MCP_METHOD_PREFIXES = [
+  'tools/',
+  'resources/',
+  'prompts/',
+  'completion/',
+  'logging/',
+  'notifications/',
+  'sampling/',
+  'roots/',
+  'elicitation/',
+  'tasks/',
+];
+
+/**
+ * Whether `method` falls inside the surface described by the two lists above.
+ * Exported so tests can assert the surface without driving a request through.
+ */
+export function isImplementedMcpMethod(method: string): boolean {
+  return (
+    IMPLEMENTED_MCP_METHODS.has(method) ||
+    IMPLEMENTED_MCP_METHOD_PREFIXES.some(prefix => method.startsWith(prefix))
+  );
 }
 
 interface SessionMetrics {
@@ -67,6 +118,7 @@ function extractMultiTenantHeaders(req: express.Request): MultiTenantHeaders {
   return {
     'x-n8n-url': req.headers['x-n8n-url'] as string | undefined,
     'x-n8n-key': req.headers['x-n8n-key'] as string | undefined,
+    'x-n8n-mcp-token': req.headers['x-n8n-mcp-token'] as string | undefined,
     'x-instance-id': req.headers['x-instance-id'] as string | undefined,
     'x-session-id': req.headers['x-session-id'] as string | undefined,
   };
@@ -96,22 +148,37 @@ function logSecurityEvent(
   logger.info(`[SECURITY] ${event}`, logEntry);
 }
 
+export interface SingleSessionHTTPServerOptions {
+  additionalTools?: AdditionalTool[];
+}
+
 export class SingleSessionHTTPServer {
   // Map to store transports by session ID (following SDK pattern)
-  private transports: { [sessionId: string]: StreamableHTTPServerTransport } = {};
-  private servers: { [sessionId: string]: N8NDocumentationMCPServer } = {};
-  private sessionMetadata: { [sessionId: string]: { lastAccess: Date; createdAt: Date } } = {};
-  private sessionContexts: { [sessionId: string]: InstanceContext | undefined } = {};
+  // Stores both StreamableHTTP and SSE transports; use instanceof to discriminate
+  // Null-prototype objects: sessionId comes from user-controlled HTTP headers
+  // (clients can send arbitrary `Mcp-Session-Id` values), so these maps must
+  // not inherit from Object.prototype. Otherwise a session id of `__proto__`
+  // or `constructor` would both pass truthiness checks and write to
+  // Object.prototype when we assign properties to the looked-up value.
+  // Addresses CodeQL js/prototype-polluting-assignment at lines 309 and 399.
+  private transports: { [sessionId: string]: StreamableHTTPServerTransport | SSEServerTransport } = Object.create(null);
+  private servers: { [sessionId: string]: N8NDocumentationMCPServer } = Object.create(null);
+  private sessionMetadata: { [sessionId: string]: { lastAccess: Date; createdAt: Date } } = Object.create(null);
+  private sessionContexts: { [sessionId: string]: InstanceContext | undefined } = Object.create(null);
   private contextSwitchLocks: Map<string, Promise<void>> = new Map();
-  private session: Session | null = null;  // Keep for SSE compatibility
-  private sseSharedResources: SharedResources | null = null;  // Reused across SSE reconnects
   private consoleManager = new ConsoleManager();
   private expressServer: any;
-  private sessionTimeout = 30 * 60 * 1000; // 30 minutes
+  // Session timeout — configurable via SESSION_TIMEOUT_MINUTES environment variable
+  // Default 30 minutes: balances memory cleanup with real editing sessions (#626)
+  private sessionTimeout = parseInt(
+    process.env.SESSION_TIMEOUT_MINUTES || '30', 10
+  ) * 60 * 1000;
   private authToken: string | null = null;
   private cleanupTimer: NodeJS.Timeout | null = null;
-  
-  constructor() {
+  private additionalTools?: AdditionalTool[];
+
+  constructor(options?: SingleSessionHTTPServerOptions) {
+    this.additionalTools = options?.additionalTools;
     // Validate environment on construction
     this.validateEnvironment();
     // No longer pre-create session - will be created per initialize request following SDK pattern
@@ -248,7 +315,102 @@ export class SingleSessionHTTPServer {
     // This ensures compatibility with all MCP clients and proxies
     return Boolean(sessionId && sessionId.length > 0);
   }
-  
+
+  /**
+   * Checks if a request body is a JSON-RPC notification (or batch of only notifications).
+   * Per JSON-RPC 2.0 §4.1, a notification is a request without an "id" member.
+   * Note: `!('id' in msg)` is strict — messages with `id: null` are treated as
+   * requests, not notifications. This is spec-compliant.
+   */
+  private isJsonRpcNotification(body: unknown): boolean {
+    if (!body || typeof body !== 'object') return false;
+    const isSingleNotification = (msg: any): boolean =>
+      msg && typeof msg.method === 'string' && !('id' in msg);
+    if (Array.isArray(body)) {
+      return body.length > 0 && body.every(isSingleNotification);
+    }
+    return isSingleNotification(body);
+  }
+
+  /**
+   * Answer methods outside the implemented JSON-RPC surface with -32601, before
+   * any session or tenant handling touches the request.
+   *
+   * The session check used to run first, so an unimplemented method came back as
+   * a session error (-32000, "No valid session ID provided and not an initialize
+   * request"). Clients speaking MCP revision 2026-07-28 probe every remote server
+   * with a session-less `server/discover` and read -32601 as "this server is
+   * 2025-era", which is what makes them fall back to the `initialize` handshake.
+   * Without it they cannot classify the server, re-probe until their retry
+   * counter runs out, and disable the connector (#994).
+   *
+   * The status code depends on whether a session id is present. The 2026-07-28
+   * Streamable HTTP spec asks for 404 alongside -32601, but to a 2025-era client
+   * a 404 on a request that carries `Mcp-Session-Id` means "session gone,
+   * re-initialize", so answering 404 there would provoke a needless teardown.
+   * Both branches carry -32601, which is what clients key on.
+   *
+   * @returns true when the request has been answered and must not be processed further
+   */
+  private handleUnimplementedMethod(req: express.Request, res: express.Response): boolean {
+    // Only single objects are classified here. Batches — removed from MCP in
+    // revision 2025-06-18 — and non-object bodies fall through to the existing
+    // handling unchanged.
+    const body = req.body;
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
+
+    const { jsonrpc, method, id } = body as {
+      jsonrpc?: unknown;
+      method?: unknown;
+      id?: unknown;
+    };
+
+    // A body that asserts a different JSON-RPC version is not ours to answer.
+    // A body that simply omits the member still is: "the client never sees
+    // -32601" is the whole of #994, and answering it is inert — no session is
+    // touched, no state written, no outbound request made — so there is nothing
+    // to be gained by withholding it from a client that sends a minimal probe.
+    if (jsonrpc !== undefined && jsonrpc !== '2.0') return false;
+    if (typeof method !== 'string' || isImplementedMcpMethod(method)) return false;
+
+    // A response is already on the wire, so there is nothing left to answer;
+    // report the request handled rather than writing to it twice.
+    if (res.headersSent) return true;
+
+    // The body limit is 10mb, so the method is caller-controlled and unbounded.
+    // Truncate before it reaches the log or the response.
+    const safeMethod = method.length > 128 ? `${method.slice(0, 128)}…` : method;
+
+    // Notifications carry no id, so there is no response channel to put an error on.
+    if (this.isJsonRpcNotification(body)) {
+      logger.info('Unimplemented JSON-RPC notification ignored', { method: safeMethod });
+      res.status(202).end();
+      return true;
+    }
+
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    logger.info('Unimplemented JSON-RPC method', { method: safeMethod, hasSessionId: !!sessionId });
+
+    if (!sessionId && res.locals) {
+      // Exempt this one response from the auth limiter's failure count. The
+      // limiter only skips responses below 400 (#265), so without this the 404
+      // branch — the steady-state answer to every new client's first probe —
+      // spends one of the 20 tokens per 15 minutes that all users share behind
+      // a proxy when TRUST_PROXY is unset. Set only here, on the 404 branch.
+      res.locals.mcpMethodNotFound = true;
+    }
+
+    res.status(sessionId ? 200 : 404).json({
+      jsonrpc: '2.0',
+      error: {
+        code: -32601,
+        message: `Method not found: ${safeMethod}`
+      },
+      id: id ?? null
+    });
+    return true;
+  }
+
   /**
    * Sanitize error information for client responses
    */
@@ -287,25 +449,95 @@ export class SingleSessionHTTPServer {
    * Update session last access time
    */
   private updateSessionAccess(sessionId: string): void {
-    if (this.sessionMetadata[sessionId]) {
+    // Own-property check (not truthy lookup) so a sessionId of `__proto__`
+    // or `constructor` can't slip through on a plain-object container and
+    // end up writing to `Object.prototype.lastAccess`. Storage is also a
+    // null-prototype object (see class-property initializers), so both
+    // layers must be bypassed for pollution to happen.
+    // Using `hasOwnProperty.call` rather than `Object.hasOwn` because the
+    // TS target is ES2020.
+    if (Object.prototype.hasOwnProperty.call(this.sessionMetadata, sessionId)) {
       this.sessionMetadata[sessionId].lastAccess = new Date();
     }
   }
 
   /**
-   * Switch session context with locking to prevent race conditions
+   * Authenticate a request by validating the Bearer token.
+   * Returns true if authentication succeeds, false if it fails
+   * (and the response has already been sent with a 401 status).
    */
-  private async switchSessionContext(sessionId: string, newContext: InstanceContext): Promise<void> {
-    // Check if there's already a switch in progress for this session
-    const existingLock = this.contextSwitchLocks.get(sessionId);
-    if (existingLock) {
-      // Wait for the existing switch to complete
-      await existingLock;
-      return;
+  private authenticateRequest(req: express.Request, res: express.Response): boolean {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      const reason = !authHeader ? 'no_auth_header' : 'invalid_auth_format';
+      logger.warn('Authentication failed', {
+        ip: req.ip,
+        userAgent: req.get('user-agent'),
+        reason
+      });
+      res.setHeader('WWW-Authenticate', buildBearerChallenge(reason));
+      res.status(401).json({
+        jsonrpc: '2.0',
+        error: { code: -32001, message: 'Unauthorized' },
+        id: null
+      });
+      return false;
+    }
+
+    const token = authHeader.slice(7).trim();
+    const isValid = this.authToken && AuthManager.timingSafeCompare(token, this.authToken);
+
+    if (!isValid) {
+      logger.warn('Authentication failed: Invalid token', {
+        ip: req.ip,
+        userAgent: req.get('user-agent'),
+        reason: 'invalid_token'
+      });
+      res.setHeader('WWW-Authenticate', buildBearerChallenge('invalid_token'));
+      res.status(401).json({
+        jsonrpc: '2.0',
+        error: { code: -32001, message: 'Unauthorized' },
+        id: null
+      });
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * Switch session context with locking to prevent race conditions.
+   *
+   * With `mergeOverStored`, `newContext` holds only the fields a request supplied and
+   * is merged over the stored context once this call holds the lock. Merging before
+   * the wait would let a queued request write back values that a request ahead of it
+   * has since replaced.
+   */
+  private async switchSessionContext(
+    sessionId: string,
+    newContext: InstanceContext,
+    mergeOverStored = false
+  ): Promise<InstanceContext | undefined> {
+    // Wait for any switch already in progress for this session, then apply this
+    // request's context as well. Returning after the wait would drop it, leaving the
+    // session on the context of whichever request got there first.
+    let existingLock = this.contextSwitchLocks.get(sessionId);
+    while (existingLock) {
+      await existingLock.catch(() => undefined);
+      existingLock = this.contextSwitchLocks.get(sessionId);
+    }
+
+    let contextToApply = newContext;
+    if (mergeOverStored) {
+      const storedContext = this.sessionContexts[sessionId];
+      // The session went away while this request waited; there is nothing to refresh.
+      if (!storedContext) return undefined;
+      contextToApply = { ...storedContext, ...newContext };
     }
 
     // Create a promise for this switch operation
-    const switchPromise = this.performContextSwitch(sessionId, newContext);
+    const switchPromise = this.performContextSwitch(sessionId, contextToApply);
     this.contextSwitchLocks.set(sessionId, switchPromise);
 
     try {
@@ -314,6 +546,7 @@ export class SingleSessionHTTPServer {
       // Clean up the lock after completion
       this.contextSwitchLocks.delete(sessionId);
     }
+    return contextToApply;
   }
 
   /**
@@ -324,7 +557,7 @@ export class SingleSessionHTTPServer {
 
     // Only switch if the context has actually changed
     if (JSON.stringify(existingContext) !== JSON.stringify(newContext)) {
-      logger.info('Multi-tenant shared mode: Updating instance context for session', {
+      logger.info('Multi-tenant mode: Updating instance context for session', {
         sessionId,
         oldInstanceId: existingContext?.instanceId,
         newInstanceId: newContext.instanceId
@@ -333,8 +566,11 @@ export class SingleSessionHTTPServer {
       // Update the session context
       this.sessionContexts[sessionId] = newContext;
 
-      // Update the MCP server's instance context if it exists
-      if (this.servers[sessionId]) {
+      // Update the MCP server's instance context if it exists. Own-property
+      // check prevents a malicious sessionId (`__proto__`) from writing
+      // `instanceContext` onto Object.prototype via a plain-object container.
+      // Storage is also null-prototype — defense in depth.
+      if (Object.prototype.hasOwnProperty.call(this.servers, sessionId)) {
         (this.servers[sessionId] as any).instanceContext = newContext;
       }
     }
@@ -454,22 +690,77 @@ export class SingleSessionHTTPServer {
     // Wrap all operations to prevent console interference
     return this.consoleManager.wrapOperation(async () => {
       try {
+        // An unimplemented method needs neither a session nor an instance
+        // context, so it is answered before either is looked at (#994). The
+        // POST /mcp route runs the same guard earlier; this call covers
+        // embedders that reach handleRequest directly (see mcp-engine.ts).
+        if (this.handleUnimplementedMethod(req, res)) {
+          return;
+        }
+
+        // SECURITY (GHSA-4ggg-h7ph-26qr): validate instance-supplied URL.
+        if (instanceContext?.n8nApiUrl) {
+          const { SSRFProtection } = await import('./utils/ssrf-protection');
+          const ssrfResult = await SSRFProtection.validateWebhookUrl(instanceContext.n8nApiUrl);
+          if (!ssrfResult.valid) {
+            logger.warn('SSRF protection blocked instance context URL', {
+              reason: ssrfResult.reason,
+              instanceId: instanceContext.instanceId
+            });
+            if (!res.headersSent) {
+              res.status(400).json({
+                jsonrpc: '2.0',
+                error: {
+                  code: -32602,
+                  message: 'Invalid instance configuration'
+                },
+                id: req.body?.id ?? null
+              });
+            }
+            return;
+          }
+        }
+
+        // #1152: embedders hand the context over directly, and it may come from untyped
+        // JSON. A non-boolean switch (the string "false") would read as enabled here and
+        // would later make validateInstanceContext reject the whole context, so refuse
+        // it up front instead of storing it on a session.
+        if (instanceContext?.uiAppsEnabled !== undefined && typeof instanceContext.uiAppsEnabled !== 'boolean') {
+          logger.warn('Instance context rejected: uiAppsEnabled must be a boolean', {
+            receivedType: typeof instanceContext.uiAppsEnabled,
+            instanceId: instanceContext.instanceId
+          });
+          if (!res.headersSent) {
+            res.status(400).json({
+              jsonrpc: '2.0',
+              error: {
+                code: -32602,
+                message: 'Invalid instance configuration: uiAppsEnabled must be a boolean'
+              },
+              id: req.body?.id ?? null
+            });
+          }
+          return;
+        }
+
         const sessionId = req.headers['mcp-session-id'] as string | undefined;
         const isInitialize = req.body ? isInitializeRequest(req.body) : false;
-        
-        // Log comprehensive incoming request details for debugging
+
+        // SECURITY (GHSA-pfm2-2mhg-8wpx): log body summary only, not payload.
         logger.info('handleRequest: Processing MCP request - SDK PATTERN', {
           requestId: req.get('x-request-id') || 'unknown',
           sessionId: sessionId,
           method: req.method,
           url: req.url,
-          bodyType: typeof req.body,
-          bodyContent: req.body ? JSON.stringify(req.body, null, 2) : 'undefined',
+          body: summarizeMcpBody(req.body),
           existingTransports: Object.keys(this.transports),
           isInitializeRequest: isInitialize
         });
         
         let transport: StreamableHTTPServerTransport;
+        // SECURITY (GHSA-74jq-crxq-6x63): the context this request runs with.
+        let requestContext: InstanceContext | undefined = instanceContext;
+        let requestServer: N8NDocumentationMCPServer | undefined;
         
         if (isInitialize) {
           // Check session limits before creating new session
@@ -485,7 +776,7 @@ export class SingleSessionHTTPServer {
                 code: -32000,
                 message: `Session limit reached (${MAX_SESSIONS}). Please wait for existing sessions to expire.`
               },
-              id: req.body?.id || null
+              id: req.body?.id ?? null
             });
             return;
           }
@@ -498,15 +789,60 @@ export class SingleSessionHTTPServer {
 
           const isMultiTenantEnabled = process.env.ENABLE_MULTI_TENANT === 'true';
           const sessionStrategy = process.env.MULTI_TENANT_SESSION_STRATEGY || 'instance';
+          // Opt-in: let multiple MCP clients (e.g. an automation agent + an IDE +
+          // a web client) hold concurrent sessions for the SAME instance. The
+          // eager cleanup below assumes one session per instance and evicts the
+          // rest on every initialize — with several concurrent clients that means
+          // each one's initialize destroys the others' live sessions, surfacing as
+          // "Session not found or expired" drops. When enabled, sessions are
+          // reclaimed only by their natural lifecycle (transport close, idle
+          // timeout, MAX_SESSIONS cap) instead of by this eager pass.
+          const allowConcurrentSessions = process.env.MULTI_TENANT_ALLOW_CONCURRENT_SESSIONS === 'true';
+
+          // EAGER CLEANUP: Remove existing sessions for the same instance only
+          // when instance-scoped sessions are requested. Shared strategy, and the
+          // concurrent-sessions opt-in, both allow multiple MCP clients to use the
+          // same tenant/instance concurrently.
+          if (isMultiTenantEnabled && sessionStrategy === 'instance' && !allowConcurrentSessions && instanceContext?.instanceId) {
+            const sessionsToRemove: string[] = [];
+            for (const [existingSessionId, context] of Object.entries(this.sessionContexts)) {
+              if (context?.instanceId === instanceContext.instanceId) {
+                sessionsToRemove.push(existingSessionId);
+              }
+            }
+            for (const oldSessionId of sessionsToRemove) {
+              // Double-check session still exists (may have been cleaned by concurrent request)
+              if (!this.transports[oldSessionId]) {
+                continue;
+              }
+              logger.info('Cleaning up previous session for instance', {
+                instanceId: instanceContext.instanceId,
+                oldSession: oldSessionId,
+                reason: 'instance_reconnect'
+              });
+              await this.removeSession(oldSessionId, 'instance_reconnect');
+            }
+          }
 
           if (isMultiTenantEnabled && sessionStrategy === 'instance' && instanceContext?.instanceId) {
             // In multi-tenant mode with instance strategy, create session per instance
             // This ensures each tenant gets isolated sessions
-            // Include configuration hash to prevent collisions with different configs
-            const configHash = createHash('sha256')
+            // Include configuration hash to prevent collisions with different configs.
+            // The credentials are part of the config identity (#1045): rotating the n8n
+            // API key or the instance-level MCP access token must change the hash, so a
+            // routing layer comparing hashes stops matching sessions bound to the old
+            // secrets. The secrets only feed the digest — the session ID and logs carry
+            // just its first 8 hex chars, never the values — and the digest is keyed
+            // with the server's auth token, so the truncated fingerprint is not an
+            // offline confirmation oracle for credential guesses (CodeQL
+            // js/insufficient-password-hash). Any legitimate hash-comparing consumer
+            // already holds AUTH_TOKEN, so cross-process comparability is preserved.
+            const configHash = createHmac('sha256', this.authToken ?? '')
               .update(JSON.stringify({
                 url: instanceContext.n8nApiUrl,
-                instanceId: instanceContext.instanceId
+                instanceId: instanceContext.instanceId,
+                n8nApiKey: instanceContext.n8nApiKey,
+                n8nMcpAccessToken: instanceContext.n8nMcpAccessToken
               }))
               .digest('hex')
               .substring(0, 8);
@@ -522,10 +858,15 @@ export class SingleSessionHTTPServer {
             sessionIdToUse = sessionId || uuidv4();
           }
 
-          const server = new N8NDocumentationMCPServer(instanceContext);
-          
+          const server = new N8NDocumentationMCPServer(instanceContext, undefined, {
+            additionalTools: this.additionalTools,
+            requireRequestContext: isMultiTenantEnabled && sessionStrategy === 'shared',
+          });
+          requestServer = server;
+
           transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => sessionIdToUse,
+            keepAliveMs: STREAMABLE_HTTP_KEEP_ALIVE_MS,
             onsessioninitialized: (initializedSessionId: string) => {
               // Store both transport and server by session ID when session is initialized
               logger.info('handleRequest: Session initialized, storing transport and server', { 
@@ -577,52 +918,124 @@ export class SingleSessionHTTPServer {
                 code: -32602,
                 message: 'Invalid session ID format'
               },
-              id: req.body?.id || null
+              id: req.body?.id ?? null
             });
             return;
           }
           
           // For non-initialize requests: reuse existing transport for this session
           logger.info('handleRequest: Reusing existing transport for session', { sessionId });
-          transport = this.transports[sessionId];
+
+          // Guard: reject SSE transports on the StreamableHTTP path
+          if (this.transports[sessionId] instanceof SSEServerTransport) {
+            logger.warn('handleRequest: SSE session used on StreamableHTTP endpoint', { sessionId });
+            res.status(400).json({
+              jsonrpc: '2.0',
+              error: {
+                code: -32000,
+                message: 'Session uses SSE transport. Send messages to POST /messages?sessionId=<id> instead.'
+              },
+              id: req.body?.id ?? null
+            });
+            return;
+          }
+
+          transport = this.transports[sessionId] as StreamableHTTPServerTransport;
+
+          // TOCTOU guard: session may have been removed between the check above and here
+          if (!transport) {
+            if (this.isJsonRpcNotification(req.body)) {
+              logger.info('handleRequest: Session removed during lookup, accepting notification', { sessionId });
+              res.status(202).end();
+              return;
+            }
+            logger.warn('handleRequest: Session removed between check and use (TOCTOU)', { sessionId });
+            res.status(404).json({
+              jsonrpc: '2.0',
+              error: { code: -32000, message: 'Session not found or expired' },
+              id: req.body?.id ?? null,
+            });
+            return;
+          }
 
           // In multi-tenant shared mode, update instance context if provided
           const isMultiTenantEnabled = process.env.ENABLE_MULTI_TENANT === 'true';
           const sessionStrategy = process.env.MULTI_TENANT_SESSION_STRATEGY || 'instance';
 
-          if (isMultiTenantEnabled && sessionStrategy === 'shared' && instanceContext) {
+          requestContext = this.sessionContexts[sessionId];
+          requestServer = this.servers[sessionId];
+          if (isMultiTenantEnabled && sessionStrategy === 'shared') {
             // Update the context for this session with locking to prevent race conditions
-            await this.switchSessionContext(sessionId, instanceContext);
+            requestContext = instanceContext
+              ? await this.switchSessionContext(sessionId, instanceContext)
+              : undefined;
+          } else if (isMultiTenantEnabled && sessionStrategy === 'instance' && instanceContext) {
+            // #1045: in instance strategy the context used to be frozen at creation, so a
+            // rotated n8n API key or MCP access token kept being served until the session
+            // idled out or the client re-initialized. Refresh it — but only from a request
+            // that carries the COMPLETE tenant identity for the SAME instance AND the SAME
+            // n8n URL this session is bound to. A partial context (GHSA-2cf7-hpwf-47h9,
+            // #844) or a different instanceId must never overwrite a session's
+            // credentials, and a changed URL is a different config identity that has to go
+            // through initialize, not mutate an existing session. Fields the request omits
+            // mean "unchanged" — merging over the stored context keeps a request without
+            // e.g. the MCP access token header from clearing a configured token.
+            const storedContext = this.sessionContexts[sessionId];
+            if (
+              instanceContext.n8nApiUrl &&
+              instanceContext.n8nApiKey &&
+              instanceContext.instanceId &&
+              storedContext?.instanceId === instanceContext.instanceId &&
+              storedContext?.n8nApiUrl === instanceContext.n8nApiUrl
+            ) {
+              requestContext =
+                await this.switchSessionContext(sessionId, pickInstanceContextFields(instanceContext), true)
+                ?? storedContext;
+            }
           }
 
           // Update session access time
           this.updateSessionAccess(sessionId);
           
         } else {
-          // Invalid request - no session ID and not an initialize request
+          // Notifications are fire-and-forget; returning 400 triggers reconnection storms (#654)
+          if (this.isJsonRpcNotification(req.body)) {
+            logger.info('handleRequest: Accepting notification for stale/missing session', {
+              method: req.body?.method,
+              sessionId: sessionId || 'none',
+            });
+            res.status(202).end();
+            return;
+          }
+
+          // Missing or malformed session IDs are bad requests. A valid-looking
+          // but unknown session ID means the session was terminated, and MCP
+          // clients use 404 as the signal to initialize a new session.
           const errorDetails = {
             hasSessionId: !!sessionId,
             isInitialize: isInitialize,
             sessionIdValid: sessionId ? this.isValidSessionId(sessionId) : false,
             sessionExists: sessionId ? !!this.transports[sessionId] : false
           };
-          
+
           logger.warn('handleRequest: Invalid request - no session ID and not initialize', errorDetails);
-          
+
           let errorMessage = 'Bad Request: No valid session ID provided and not an initialize request';
+          let statusCode = 400;
           if (sessionId && !this.isValidSessionId(sessionId)) {
             errorMessage = 'Bad Request: Invalid session ID format';
           } else if (sessionId && !this.transports[sessionId]) {
-            errorMessage = 'Bad Request: Session not found or expired';
+            errorMessage = 'Session not found or expired';
+            statusCode = 404;
           }
-          
-          res.status(400).json({
+
+          res.status(statusCode).json({
             jsonrpc: '2.0',
             error: {
               code: -32000,
               message: errorMessage
             },
-            id: req.body?.id || null
+            id: req.body?.id ?? null
           });
           return;
         }
@@ -632,7 +1045,11 @@ export class SingleSessionHTTPServer {
           sessionId: isInitialize ? 'new' : sessionId,
           isInitialize 
         });
-        await transport.handleRequest(req, res, req.body);
+        if (requestServer) {
+          await runWithRequestContext(requestServer, requestContext, () => transport.handleRequest(req, res, req.body));
+        } else {
+          await transport.handleRequest(req, res, req.body);
+        }
         
         const duration = Date.now() - startTime;
         logger.info('MCP request completed', { duration, sessionId: transport.sessionId });
@@ -664,7 +1081,7 @@ export class SingleSessionHTTPServer {
                 code: sanitizedError.code
               }
             },
-            id: req.body?.id || null
+            id: req.body?.id ?? null
           });
         }
       }
@@ -673,70 +1090,47 @@ export class SingleSessionHTTPServer {
   
 
   /**
-   * Reset the session for SSE - reuse shared resources, only create new transport
+   * Create a new SSE session and store it in the shared transports map.
+   * Following SDK pattern: SSE uses /messages endpoint, separate from /mcp.
    */
-  private async resetSessionSSE(res: express.Response): Promise<void> {
-    // Clean up old session if exists
-    if (this.session) {
-      try {
-        logger.info('Closing previous SSE session', { sessionId: this.session.sessionId });
-        // Close server (will not close shared resources due to ownsResources flag)
-        await this.session.server.close();
-        await this.session.transport.close();
-      } catch (error) {
-        logger.warn('Error closing previous session:', error);
-      }
+  private async createSSESession(res: express.Response): Promise<void> {
+    if (!this.canCreateSession()) {
+      logger.warn('SSE session creation rejected: session limit reached', {
+        currentSessions: this.getActiveSessionCount(),
+        maxSessions: MAX_SESSIONS
+      });
+      throw new Error(`Session limit reached (${MAX_SESSIONS})`);
     }
 
-    try {
-      // Initialize shared resources on first SSE connection
-      if (!this.sseSharedResources) {
-        logger.info('Creating shared resources for SSE (first connection)...');
-        const initialServer = new N8NDocumentationMCPServer();
-        this.sseSharedResources = await initialServer.getSharedResources();
-        if (!this.sseSharedResources) {
-          throw new Error('Failed to get shared resources from initial server');
-        }
-        // Close the initial server (but resources stay open since we extracted them)
-        await initialServer.close();
-        logger.info('Shared resources created successfully');
-      }
+    // Note: SSE sessions do not support multi-tenant context.
+    // The SaaS backend uses StreamableHTTP exclusively.
+    const server = new N8NDocumentationMCPServer(undefined, undefined, {
+      additionalTools: this.additionalTools,
+    });
 
-      // Create new server with shared resources (lightweight - no DB init)
-      logger.info('Creating N8NDocumentationMCPServer with shared resources...');
-      const server = new N8NDocumentationMCPServer(undefined, undefined, this.sseSharedResources);
+    const transport = new SSEServerTransport('/messages', res);
+    // Use the SDK-assigned session ID — the client receives this via the SSE
+    // `endpoint` event and sends it back as ?sessionId on POST /messages.
+    const sessionId = transport.sessionId;
 
-      // Generate cryptographically secure session ID
-      const sessionId = uuidv4();
+    this.transports[sessionId] = transport;
+    this.servers[sessionId] = server;
+    this.sessionMetadata[sessionId] = {
+      lastAccess: new Date(),
+      createdAt: new Date()
+    };
 
-      logger.info('Creating SSEServerTransport...');
-      const transport = new SSEServerTransport('/mcp', res);
+    // Clean up on SSE disconnect
+    res.on('close', () => {
+      logger.info('SSE connection closed by client', { sessionId });
+      this.removeSession(sessionId, 'sse_disconnect').catch(err => {
+        logger.warn('Error cleaning up SSE session on disconnect', { sessionId, error: err });
+      });
+    });
 
-      logger.info('Connecting server to SSE transport...');
-      await server.connect(transport);
+    await server.connect(transport);
 
-      this.session = {
-        server,
-        transport,
-        lastAccess: new Date(),
-        sessionId,
-        initialized: false,
-        isSSE: true
-      };
-
-      logger.info('Created SSE session with shared resources', { sessionId: this.session.sessionId });
-    } catch (error) {
-      logger.error('Failed to create SSE session:', error);
-      throw error;
-    }
-  }
-  
-  /**
-   * Check if current session is expired
-   */
-  private isExpired(): boolean {
-    if (!this.session) return true;
-    return Date.now() - this.session.lastAccess.getTime() > this.sessionTimeout;
+    logger.info('SSE session created', { sessionId, transport: 'SSEServerTransport' });
   }
 
   /**
@@ -805,7 +1199,50 @@ export class SingleSessionHTTPServer {
       });
       next();
     });
-    
+
+    // SECURITY: Rate limiting for authentication endpoints
+    // Prevents brute force attacks and DoS
+    // See: https://github.com/czlonkowski/n8n-mcp/issues/265 (HIGH-02)
+    // Declared before route registrations so all authenticated endpoints
+    // (including GET /mcp and DELETE /mcp) can reference it.
+    const authLimiter = rateLimit({
+      windowMs: parseInt(process.env.AUTH_RATE_LIMIT_WINDOW || '900000'), // 15 minutes
+      max: parseInt(process.env.AUTH_RATE_LIMIT_MAX || '20'), // 20 authentication attempts per IP
+      message: {
+        jsonrpc: '2.0',
+        error: {
+          code: -32000,
+          message: 'Too many authentication attempts. Please try again later.'
+        },
+        id: null
+      },
+      standardHeaders: true, // Return rate limit info in `RateLimit-*` headers
+      legacyHeaders: false, // Disable `X-RateLimit-*` headers
+      skipSuccessfulRequests: true, // Only count failed auth attempts (#617)
+      // A "method not found" answer is a correct protocol response, not a failed
+      // authentication attempt, but it carries 404 on the session-less branch and
+      // the default predicate counts anything at or above 400. The guard that
+      // emits it runs after authentication, so an unauthenticated caller can
+      // never reach it and this cannot help a brute-forcer (#994, #265).
+      requestWasSuccessful: (_req: express.Request, res: express.Response) =>
+        res.statusCode < 400 || res.locals?.mcpMethodNotFound === true,
+      handler: (req, res) => {
+        logger.warn('Rate limit exceeded', {
+          ip: req.ip,
+          userAgent: req.get('user-agent'),
+          event: 'rate_limit'
+        });
+        res.status(429).json({
+          jsonrpc: '2.0',
+          error: {
+            code: -32000,
+            message: 'Too many authentication attempts'
+          },
+          id: null
+        });
+      }
+    });
+
     // Root endpoint with API information
     app.get('/', (req, res) => {
       const port = parseInt(process.env.PORT || '3000');
@@ -832,102 +1269,40 @@ export class SingleSessionHTTPServer {
         authentication: {
           type: 'Bearer Token',
           header: 'Authorization: Bearer <token>',
-          required_for: ['POST /mcp']
+          required_for: ['POST /mcp', 'GET /mcp', 'DELETE /mcp', 'GET /sse', 'POST /messages']
         },
         documentation: 'https://github.com/czlonkowski/n8n-mcp'
       });
     });
 
     // Health check endpoint (no body parsing needed for GET)
+    // Intentionally minimal: used by Docker HEALTHCHECK and CI without credentials.
+    // Must not disclose session IDs, token metadata, memory stats, environment
+    // flags, or any other operationally sensitive detail — those belong behind
+    // auth. status/version/uptime/timestamp is the standard liveness envelope.
     app.get('/health', (req, res) => {
-      const activeTransports = Object.keys(this.transports);
-      const activeServers = Object.keys(this.servers);
-      const sessionMetrics = this.getSessionMetrics();
-      const isProduction = process.env.NODE_ENV === 'production';
-      const isDefaultToken = this.authToken === 'REPLACE_THIS_AUTH_TOKEN_32_CHARS_MIN_abcdefgh';
-      
-      res.json({ 
-        status: 'ok', 
-        mode: 'sdk-pattern-transports',
+      res.json({
+        status: 'ok',
         version: PROJECT_VERSION,
-        environment: process.env.NODE_ENV || 'development',
         uptime: Math.floor(process.uptime()),
-        sessions: {
-          active: sessionMetrics.activeSessions,
-          total: sessionMetrics.totalSessions,
-          expired: sessionMetrics.expiredSessions,
-          max: MAX_SESSIONS,
-          usage: `${sessionMetrics.activeSessions}/${MAX_SESSIONS}`,
-          sessionIds: activeTransports
-        },
-        security: {
-          production: isProduction,
-          defaultToken: isDefaultToken,
-          tokenLength: this.authToken?.length || 0
-        },
-        activeTransports: activeTransports.length, // Legacy field
-        activeServers: activeServers.length, // Legacy field
-        legacySessionActive: !!this.session, // For SSE compatibility
-        memory: {
-          used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
-          total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024),
-          unit: 'MB'
-        },
         timestamp: new Date().toISOString()
       });
     });
     
-    // Test endpoint for manual testing without auth
-    app.post('/mcp/test', jsonParser, async (req: express.Request, res: express.Response): Promise<void> => {
-      logger.info('TEST ENDPOINT: Manual test request received', {
-        method: req.method,
-        headers: req.headers,
-        body: req.body,
-        bodyType: typeof req.body,
-        bodyContent: req.body ? JSON.stringify(req.body, null, 2) : 'undefined'
-      });
-      
-      // Negotiate protocol version for test endpoint
-      const negotiationResult = negotiateProtocolVersion(
-        undefined, // no client version in test
-        undefined, // no client info
-        req.get('user-agent'),
-        req.headers
-      );
-      
-      logProtocolNegotiation(negotiationResult, logger, 'TEST_ENDPOINT');
-      
-      // Test what a basic MCP initialize request should look like
-      const testResponse = {
-        jsonrpc: '2.0',
-        id: req.body?.id || 1,
-        result: {
-          protocolVersion: negotiationResult.version,
-          capabilities: {
-            tools: {}
-          },
-          serverInfo: {
-            name: 'n8n-mcp',
-            version: PROJECT_VERSION
-          }
-        }
-      };
-      
-      logger.info('TEST ENDPOINT: Sending test response', {
-        response: testResponse
-      });
-      
-      res.json(testResponse);
-    });
+    // MCP GET endpoint — StreamableHTTP server-to-client stream + discovery info.
+    // Requires authentication because a session ID in the header hands the request
+    // off to an existing transport; an unauth caller with a leaked session ID
+    // could interact with another client's stream.
+    app.get('/mcp', authLimiter, async (req, res) => {
+      if (!this.authenticateRequest(req, res)) return;
 
-    // MCP information endpoint (no auth required for discovery) and SSE support
-    app.get('/mcp', async (req, res) => {
       // Handle StreamableHTTP transport requests with new pattern
       const sessionId = req.headers['mcp-session-id'] as string | undefined;
-      if (sessionId && this.transports[sessionId]) {
+      const existingTransport = sessionId ? this.transports[sessionId] : undefined;
+      if (existingTransport && existingTransport instanceof StreamableHTTPServerTransport) {
         // Let the StreamableHTTPServerTransport handle the GET request
         try {
-          await this.transports[sessionId].handleRequest(req, res, undefined);
+          await existingTransport.handleRequest(req, res, undefined);
           return;
         } catch (error) {
           logger.error('StreamableHTTP GET request failed:', error);
@@ -935,26 +1310,15 @@ export class SingleSessionHTTPServer {
         }
       }
       
-      // Check Accept header for text/event-stream (SSE support)
+      // SSE clients should use GET /sse instead (SDK pattern: separate endpoints)
       const accept = req.headers.accept;
       if (accept && accept.includes('text/event-stream')) {
-        logger.info('SSE stream request received - establishing SSE connection');
-        
-        try {
-          // Create or reset session for SSE
-          await this.resetSessionSSE(res);
-          logger.info('SSE connection established successfully');
-        } catch (error) {
-          logger.error('Failed to establish SSE connection:', error);
-          res.status(500).json({
-            jsonrpc: '2.0',
-            error: {
-              code: -32603,
-              message: 'Failed to establish SSE connection'
-            },
-            id: null
-          });
-        }
+        logger.info('SSE request on /mcp redirected to /sse', { ip: req.ip });
+        res.status(400).json({
+          error: 'SSE transport uses /sse endpoint',
+          message: 'Connect via GET /sse for SSE streaming. POST messages to /messages?sessionId=<id>.',
+          documentation: 'https://github.com/czlonkowski/n8n-mcp'
+        });
         return;
       }
 
@@ -991,13 +1355,33 @@ export class SingleSessionHTTPServer {
           mcp: {
             method: 'POST',
             path: '/mcp',
-            description: 'Main MCP JSON-RPC endpoint',
+            description: 'Main MCP JSON-RPC endpoint (StreamableHTTP)',
             authentication: 'Bearer token required'
+          },
+          mcpDelete: {
+            method: 'DELETE',
+            path: '/mcp',
+            description: 'Terminate an active MCP session by Mcp-Session-Id header',
+            authentication: 'Bearer token required'
+          },
+          sse: {
+            method: 'GET',
+            path: '/sse',
+            description: 'DEPRECATED: SSE stream for legacy clients. Migrate to StreamableHTTP (POST /mcp).',
+            authentication: 'Bearer token required',
+            deprecated: true
+          },
+          messages: {
+            method: 'POST',
+            path: '/messages',
+            description: 'DEPRECATED: Message delivery for SSE sessions. Migrate to StreamableHTTP (POST /mcp).',
+            authentication: 'Bearer token required',
+            deprecated: true
           },
           health: {
             method: 'GET',
             path: '/health',
-            description: 'Health check endpoint',
+            description: 'Minimal liveness check (status, version, uptime)',
             authentication: 'None'
           },
           root: {
@@ -1011,8 +1395,81 @@ export class SingleSessionHTTPServer {
       });
     });
 
-    // Session termination endpoint
-    app.delete('/mcp', async (req: express.Request, res: express.Response): Promise<void> => {
+    // Legacy SSE stream endpoint (protocol version 2024-11-05)
+    // DEPRECATED: SSE transport is deprecated in MCP SDK v1.x and removed in v2.x.
+    // Clients should migrate to StreamableHTTP (POST /mcp). This endpoint will be
+    // removed in a future major release.
+    app.get('/sse', authLimiter, async (req: express.Request, res: express.Response): Promise<void> => {
+      if (!this.authenticateRequest(req, res)) return;
+
+      logger.warn('SSE transport is deprecated and will be removed in a future release. Migrate to StreamableHTTP (POST /mcp).', {
+        ip: req.ip,
+        userAgent: req.get('user-agent')
+      });
+
+      try {
+        await this.createSSESession(res);
+      } catch (error) {
+        logger.error('Failed to create SSE session:', error);
+        if (!res.headersSent) {
+          res.status(error instanceof Error && error.message.includes('Session limit')
+            ? 429 : 500
+          ).json({
+            error: error instanceof Error ? error.message : 'Failed to establish SSE connection'
+          });
+        }
+      }
+    });
+
+    // SSE message delivery endpoint (receives JSON-RPC messages from SSE clients)
+    app.post('/messages', authLimiter, jsonParser, async (req: express.Request, res: express.Response): Promise<void> => {
+      if (!this.authenticateRequest(req, res)) return;
+
+      // SSE uses ?sessionId query param (not mcp-session-id header)
+      const sessionId = req.query.sessionId as string | undefined;
+
+      if (!sessionId) {
+        res.status(400).json({
+          jsonrpc: '2.0',
+          error: { code: -32602, message: 'Missing sessionId query parameter' },
+          id: req.body?.id ?? null
+        });
+        return;
+      }
+
+      const transport = this.transports[sessionId];
+
+      if (!transport || !(transport instanceof SSEServerTransport)) {
+        res.status(400).json({
+          jsonrpc: '2.0',
+          error: { code: -32000, message: 'SSE session not found or expired' },
+          id: req.body?.id ?? null
+        });
+        return;
+      }
+
+      // Update session access time
+      this.updateSessionAccess(sessionId);
+
+      try {
+        await transport.handlePostMessage(req, res, req.body);
+      } catch (error) {
+        logger.error('SSE message handling error', { sessionId, error });
+        if (!res.headersSent) {
+          res.status(500).json({
+            jsonrpc: '2.0',
+            error: { code: -32603, message: 'Internal error processing SSE message' },
+            id: req.body?.id ?? null
+          });
+        }
+      }
+    });
+
+    // Session termination endpoint — must require authentication, otherwise any
+    // unauthenticated client can terminate arbitrary MCP sessions (GHSA-75hx-xj24-mqrw).
+    app.delete('/mcp', authLimiter, async (req: express.Request, res: express.Response): Promise<void> => {
+      if (!this.authenticateRequest(req, res)) return;
+
       const mcpSessionId = req.headers['mcp-session-id'] as string;
       
       if (!mcpSessionId) {
@@ -1069,59 +1526,8 @@ export class SingleSessionHTTPServer {
       }
     });
 
-
-    // SECURITY: Rate limiting for authentication endpoint
-    // Prevents brute force attacks and DoS
-    // See: https://github.com/czlonkowski/n8n-mcp/issues/265 (HIGH-02)
-    const authLimiter = rateLimit({
-      windowMs: parseInt(process.env.AUTH_RATE_LIMIT_WINDOW || '900000'), // 15 minutes
-      max: parseInt(process.env.AUTH_RATE_LIMIT_MAX || '20'), // 20 authentication attempts per IP
-      message: {
-        jsonrpc: '2.0',
-        error: {
-          code: -32000,
-          message: 'Too many authentication attempts. Please try again later.'
-        },
-        id: null
-      },
-      standardHeaders: true, // Return rate limit info in `RateLimit-*` headers
-      legacyHeaders: false, // Disable `X-RateLimit-*` headers
-      handler: (req, res) => {
-        logger.warn('Rate limit exceeded', {
-          ip: req.ip,
-          userAgent: req.get('user-agent'),
-          event: 'rate_limit'
-        });
-        res.status(429).json({
-          jsonrpc: '2.0',
-          error: {
-            code: -32000,
-            message: 'Too many authentication attempts'
-          },
-          id: null
-        });
-      }
-    });
-
     // Main MCP endpoint with authentication and rate limiting
     app.post('/mcp', authLimiter, jsonParser, async (req: express.Request, res: express.Response): Promise<void> => {
-      // Log comprehensive debug info about the request
-      logger.info('POST /mcp request received - DETAILED DEBUG', {
-        headers: req.headers,
-        readable: req.readable,
-        readableEnded: req.readableEnded,
-        complete: req.complete,
-        bodyType: typeof req.body,
-        bodyContent: req.body ? JSON.stringify(req.body, null, 2) : 'undefined',
-        contentLength: req.get('content-length'),
-        contentType: req.get('content-type'),
-        userAgent: req.get('user-agent'),
-        ip: req.ip,
-        method: req.method,
-        url: req.url,
-        originalUrl: req.originalUrl
-      });
-      
       // Handle connection close to immediately clean up sessions
       const sessionId = req.headers['mcp-session-id'] as string | undefined;
       // Only add event listener if the request object supports it (not in test mocks)
@@ -1153,116 +1559,113 @@ export class SingleSessionHTTPServer {
         });
       }
       
-      // Enhanced authentication check with specific logging
-      const authHeader = req.headers.authorization;
-      
-      // Check if Authorization header is missing
-      if (!authHeader) {
-        logger.warn('Authentication failed: Missing Authorization header', { 
-          ip: req.ip,
-          userAgent: req.get('user-agent'),
-          reason: 'no_auth_header'
-        });
-        res.status(401).json({ 
-          jsonrpc: '2.0',
-          error: {
-            code: -32001,
-            message: 'Unauthorized'
-          },
-          id: null
-        });
-        return;
-      }
-      
-      // Check if Authorization header has Bearer prefix
-      if (!authHeader.startsWith('Bearer ')) {
-        logger.warn('Authentication failed: Invalid Authorization header format (expected Bearer token)', { 
-          ip: req.ip,
-          userAgent: req.get('user-agent'),
-          reason: 'invalid_auth_format',
-          headerPrefix: authHeader.substring(0, Math.min(authHeader.length, 10)) + '...'  // Log first 10 chars for debugging
-        });
-        res.status(401).json({ 
-          jsonrpc: '2.0',
-          error: {
-            code: -32001,
-            message: 'Unauthorized'
-          },
-          id: null
-        });
-        return;
-      }
-      
-      // Extract token and trim whitespace
-      const token = authHeader.slice(7).trim();
+      if (!this.authenticateRequest(req, res)) return;
 
-      // SECURITY: Use timing-safe comparison to prevent timing attacks
-      // See: https://github.com/czlonkowski/n8n-mcp/issues/265 (CRITICAL-02)
-      const isValidToken = this.authToken &&
-        AuthManager.timingSafeCompare(token, this.authToken);
-
-      if (!isValidToken) {
-        logger.warn('Authentication failed: Invalid token', {
-          ip: req.ip,
-          userAgent: req.get('user-agent'),
-          reason: 'invalid_token'
-        });
-        res.status(401).json({
-          jsonrpc: '2.0',
-          error: {
-            code: -32001,
-            message: 'Unauthorized'
-          },
-          id: null
-        });
-        return;
-      }
-      
-      // Handle request with single session
-      logger.info('Authentication successful - proceeding to handleRequest', {
-        hasSession: !!this.session,
-        sessionType: this.session?.isSSE ? 'SSE' : 'StreamableHTTP',
-        sessionInitialized: this.session?.initialized
+      // SECURITY (GHSA-pfm2-2mhg-8wpx): redacted summary only, post-auth.
+      logger.debug('POST /mcp authenticated', {
+        ip: req.ip,
+        userAgent: req.get('user-agent'),
+        contentType: req.get('content-type'),
+        contentLength: req.get('content-length'),
+        headers: redactHeaders(req.headers),
+        body: summarizeMcpBody(req.body),
+        activeSessions: this.getActiveSessionCount()
       });
 
+      // Answer unimplemented methods ahead of the multi-tenant header check: a
+      // probe such as `server/discover` carries no tenant headers, and rejecting
+      // it as a missing-tenant error would hide the -32601 the client waits for.
+      if (this.handleUnimplementedMethod(req, res)) return;
+
       // Extract instance context from headers if present (for multi-tenant support)
-      const instanceContext: InstanceContext | undefined = (() => {
+      let instanceContext: InstanceContext | undefined;
+      {
         // Use type-safe header extraction
         const headers = extractMultiTenantHeaders(req);
         const hasUrl = headers['x-n8n-url'];
         const hasKey = headers['x-n8n-key'];
+        const hasMcpToken = headers['x-n8n-mcp-token'];
 
-        if (!hasUrl && !hasKey) return undefined;
-
-        // Create context with proper type handling
-        const context: InstanceContext = {
-          n8nApiUrl: hasUrl || undefined,
-          n8nApiKey: hasKey || undefined,
-          instanceId: headers['x-instance-id'] || undefined,
-          sessionId: headers['x-session-id'] || undefined
-        };
-
-        // Add metadata if available
-        if (req.headers['user-agent'] || req.ip) {
-          context.metadata = {
-            userAgent: req.headers['user-agent'] as string | undefined,
-            ip: req.ip
-          };
-        }
-
-        // Validate the context
-        const validation = validateInstanceContext(context);
-        if (!validation.valid) {
-          logger.warn('Invalid instance context from headers', {
-            errors: validation.errors,
+        // SECURITY (GHSA-jxx9-px88-pj69, GHSA-2cf7-hpwf-47h9): in multi-tenant
+        // mode both tenant headers are required; an incomplete context is
+        // rejected.
+        const multiTenantIncomplete = process.env.ENABLE_MULTI_TENANT === 'true' && (!hasUrl || !hasKey);
+        // The same completeness rule applies to x-n8n-mcp-token in any mode:
+        // the MCP endpoint is derived from x-n8n-url, so a token on its own
+        // cannot address the caller's instance. Without this the request
+        // would fall through to N8N_MCP_ACCESS_TOKEN from the environment —
+        // the operator's own token, against the operator's own instance.
+        const mcpTokenWithoutUrl = !!hasMcpToken && !hasUrl;
+        if (multiTenantIncomplete || mcpTokenWithoutUrl) {
+          logger.warn('Request with an incomplete instance header set', {
             hasUrl: !!hasUrl,
-            hasKey: !!hasKey
+            hasKey: !!hasKey,
+            hasMcpToken: !!hasMcpToken,
+            multiTenant: process.env.ENABLE_MULTI_TENANT === 'true'
           });
-          return undefined;
+          res.status(400).json({
+            jsonrpc: '2.0',
+            error: {
+              code: -32602,
+              message: multiTenantIncomplete
+                ? 'Multi-tenant headers required'
+                : 'x-n8n-mcp-token requires x-n8n-url'
+            },
+            id: req.body?.id ?? null
+          });
+          return;
         }
 
-        return context;
-      })();
+        if (hasUrl || hasKey || hasMcpToken) {
+          // Create context with proper type handling. A context carrying
+          // n8nApiUrl plus either credential is authoritative for official-MCP
+          // calls (resolveOfficialMcpConfig never falls back to the
+          // environment for it). getN8nApiClient (the Public API client) is
+          // stricter: without n8nApiKey it falls back to the environment
+          // client in single-tenant mode, so a url+token-only context routes
+          // official calls to the header instance while Public API calls
+          // (the consent write behind exposeToMcp, and the pinned/direct
+          // trigger-detection read) resolve to the operator's own instance —
+          // mcp-exposure.ts refuses those with NOT_CONFIGURED rather than
+          // letting them proceed against the wrong instance.
+          const candidate: InstanceContext = {
+            n8nApiUrl: hasUrl || undefined,
+            n8nApiKey: hasKey || undefined,
+            n8nMcpAccessToken: hasMcpToken || undefined,
+            instanceId: headers['x-instance-id'] || undefined,
+            sessionId: headers['x-session-id'] || undefined
+          };
+
+          // Add metadata if available
+          if (req.headers['user-agent'] || req.ip) {
+            candidate.metadata = {
+              userAgent: req.headers['user-agent'] as string | undefined,
+              ip: req.ip
+            };
+          }
+
+          // SECURITY (GHSA-4ggg-h7ph-26qr): fail closed on invalid context.
+          const validation = validateInstanceContext(candidate);
+          if (!validation.valid) {
+            logger.warn('Invalid instance context from headers', {
+              errors: validation.errors,
+              hasUrl: !!hasUrl,
+              hasKey: !!hasKey
+            });
+            res.status(400).json({
+              jsonrpc: '2.0',
+              error: {
+                code: -32602,
+                message: 'Invalid instance configuration'
+              },
+              id: req.body?.id ?? null
+            });
+            return;
+          }
+
+          instanceContext = candidate;
+        }
+      }
 
       // Log context extraction for debugging (only if context exists)
       if (instanceContext) {
@@ -1281,7 +1684,7 @@ export class SingleSessionHTTPServer {
       logger.info('POST /mcp request completed - checking response status', {
         responseHeadersSent: res.headersSent,
         responseStatusCode: res.statusCode,
-        responseFinished: res.finished
+        responseFinished: res.writableEnded
       });
     });
     
@@ -1336,6 +1739,7 @@ export class SingleSessionHTTPServer {
       console.log(`Session Limits: ${MAX_SESSIONS} max sessions, ${this.sessionTimeout / 1000 / 60}min timeout`);
       console.log(`Health check: ${endpoints.health}`);
       console.log(`MCP endpoint: ${endpoints.mcp}`);
+      console.log(`SSE endpoint: ${baseUrl}/sse (legacy clients)`);
       
       if (isProduction) {
         console.log('🔒 Running in PRODUCTION mode - enhanced security enabled');
@@ -1402,17 +1806,6 @@ export class SingleSessionHTTPServer {
       }
     }
     
-    // Clean up legacy session (for SSE compatibility)
-    if (this.session) {
-      try {
-        await this.session.transport.close();
-        logger.info('Legacy session closed');
-      } catch (error) {
-        logger.warn('Error closing legacy session:', error);
-      }
-      this.session = null;
-    }
-    
     // Close Express server
     if (this.expressServer) {
       await new Promise<void>((resolve) => {
@@ -1422,7 +1815,36 @@ export class SingleSessionHTTPServer {
         });
       });
     }
-    
+
+    // Ship queued telemetry before the process exits. This server closes each
+    // session's MCP server directly rather than calling its shutdown(), so the
+    // flush there does not cover this path. Lazy-required so telemetry stays off
+    // the module load path. Bounded and non-throwing.
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { telemetry } = require('./telemetry');
+      await telemetry.flushBeforeExit();
+    } catch (error) {
+      logger.debug('Telemetry flush during shutdown failed:', error);
+    }
+
+    // Close every cached n8n MCP client, so their transports and pinned
+    // undici dispatchers do not keep the process alive.
+    try {
+      await clearOfficialMcpClientCache();
+    } catch (error) {
+      logger.warn('Error closing n8n MCP clients:', error);
+    }
+
+    // Close the shared database connection (only during process shutdown)
+    // This must happen after all sessions are closed
+    try {
+      await closeSharedDatabase();
+      logger.info('Shared database closed');
+    } catch (error) {
+      logger.warn('Error closing shared database:', error);
+    }
+
     logger.info('Single-Session HTTP server shutdown completed');
   }
   
@@ -1442,25 +1864,9 @@ export class SingleSessionHTTPServer {
     };
   } {
     const metrics = this.getSessionMetrics();
-    
-    // Legacy SSE session info
-    if (!this.session) {
-      return { 
-        active: false,
-        sessions: {
-          total: metrics.totalSessions,
-          active: metrics.activeSessions,
-          expired: metrics.expiredSessions,
-          max: MAX_SESSIONS,
-          sessionIds: Object.keys(this.transports)
-        }
-      };
-    }
-    
+
     return {
-      active: true,
-      sessionId: this.session.sessionId,
-      age: Date.now() - this.session.lastAccess.getTime(),
+      active: metrics.activeSessions > 0,
       sessions: {
         total: metrics.totalSessions,
         active: metrics.activeSessions,
@@ -1513,7 +1919,7 @@ export class SingleSessionHTTPServer {
 
       // Skip sessions without context - these can't be restored meaningfully
       // (Context is required to reconnect to the correct n8n instance)
-      if (!context || !context.n8nApiUrl || !context.n8nApiKey) {
+      if (!context?.n8nApiUrl || !context?.n8nApiKey) {
         logger.debug(`Skipping session ${sessionId} - missing required context`);
         continue;
       }
@@ -1525,12 +1931,16 @@ export class SingleSessionHTTPServer {
           createdAt: metadata.createdAt.toISOString(),
           lastAccess: metadata.lastAccess.toISOString()
         },
+        // Copy every declared InstanceContext field instead of re-listing them here:
+        // a hand-maintained list silently dropped n8nMcpAccessToken (and the
+        // timeout/retry tuning) when those fields were added to InstanceContext
+        // (#1045). The pick keeps embedder-supplied extra properties out of the
+        // persisted plaintext; its key list is compile-time checked for completeness.
         context: {
+          ...pickInstanceContextFields(context),
           n8nApiUrl: context.n8nApiUrl,
           n8nApiKey: context.n8nApiKey,
-          instanceId: context.instanceId || sessionId, // Use sessionId as fallback
-          sessionId: context.sessionId,
-          metadata: context.metadata
+          instanceId: context.instanceId || sessionId // Use sessionId as fallback
         }
       });
     }
@@ -1549,6 +1959,12 @@ export class SingleSessionHTTPServer {
    *
    * Restored sessions are "dormant" until a client makes a request, at which
    * point the transport and server will be initialized normally.
+   *
+   * @security Restored contexts are validated synchronously via
+   * validateInstanceContext, and must additionally carry BOTH n8nApiUrl and
+   * n8nApiKey — partial tenant contexts are rejected (GHSA-2cf7-hpwf-47h9
+   * hardening, #844). Embedders are responsible for not persisting hostnames
+   * they do not trust. See GHSA-4ggg-h7ph-26qr.
    *
    * @param sessions - Array of session state objects from exportSessionState()
    * @returns Number of sessions successfully restored
@@ -1625,20 +2041,39 @@ export class SingleSessionHTTPServer {
           continue;
         }
 
+        // SECURITY (GHSA-2cf7-hpwf-47h9 hardening, #844): require BOTH tenant
+        // credentials, mirroring the export-side guard. validateInstanceContext
+        // checks each field only when it is !== undefined, so a partial context
+        // carrying only one of n8nApiUrl/n8nApiKey passes validation and would
+        // restore as a partial tenant identity. The earlier no-context check
+        // above already skips sessions that carry no context at all, so this
+        // guard only applies to sessions whose context is present but incomplete.
+        if (!sessionState.context.n8nApiUrl || !sessionState.context.n8nApiKey) {
+          const reason = 'restored context missing required tenant credentials (both n8nApiUrl and n8nApiKey are required)';
+          logger.warn(
+            `Skipping session ${sessionState.sessionId} - ${reason}`
+          );
+          logSecurityEvent('session_restore_failed', {
+            sessionId: sessionState.sessionId,
+            reason
+          });
+          continue;
+        }
+
         // Restore session metadata
         this.sessionMetadata[sessionState.sessionId] = {
           createdAt,
           lastAccess
         };
 
-        // Restore session context
-        this.sessionContexts[sessionState.sessionId] = {
-          n8nApiUrl: sessionState.context.n8nApiUrl,
-          n8nApiKey: sessionState.context.n8nApiKey,
-          instanceId: sessionState.context.instanceId,
-          sessionId: sessionState.context.sessionId,
-          metadata: sessionState.context.metadata
-        };
+        // Restore session context. Copy every declared InstanceContext field — a
+        // hand-maintained field list silently dropped n8nMcpAccessToken for every
+        // restored session (#1045) — while keeping unknown keys from the persisted
+        // JSON out of the live context. The context has already passed
+        // validateInstanceContext plus the credential-completeness guard above.
+        this.sessionContexts[sessionState.sessionId] = pickInstanceContextFields(
+          sessionState.context
+        );
 
         logger.debug(`Restored session ${sessionState.sessionId}`);
         logSecurityEvent('session_restore', {

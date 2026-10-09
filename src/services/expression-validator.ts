@@ -3,6 +3,9 @@
  * Validates expression syntax, variable references, and context availability
  */
 
+import { blankStringLiterals, checkJmespathQuery, findJmespathCalls } from '../utils/jmespath-checks';
+import { extractBracketExpressions, hasDanglingOpenBracket } from '../utils/expression-utils';
+
 interface ExpressionValidationResult {
   valid: boolean;
   errors: string[];
@@ -19,8 +22,23 @@ interface ExpressionContext {
 }
 
 export class ExpressionValidator {
-  // Common n8n expression patterns
-  private static readonly EXPRESSION_PATTERN = /\{\{([\s\S]+?)\}\}/g;
+  // Bare n8n variable references missing {{ }} wrappers
+  private static readonly BARE_EXPRESSION_PATTERNS: Array<{ pattern: RegExp; name: string }> = [
+    { pattern: /^\$json[.\[]/, name: '$json' },
+    { pattern: /^\$node\[/, name: '$node' },
+    { pattern: /^\$input\./, name: '$input' },
+    { pattern: /^\$execution\./, name: '$execution' },
+    { pattern: /^\$workflow\./, name: '$workflow' },
+    { pattern: /^\$prevNode\./, name: '$prevNode' },
+    { pattern: /^\$env\./, name: '$env' },
+    { pattern: /^\$(now|today|itemIndex|runIndex)$/, name: 'built-in variable' },
+  ];
+
+  // Expression extraction is now handled by the linear-time
+  // `extractBracketExpressions` helper in utils/expression-utils.
+  /** Expressions longer than this skip the JMESPath scan; the scan is linear but bounded anyway. */
+  private static readonly MAX_JMESPATH_SCAN_LENGTH = 50_000;
+
   private static readonly VARIABLE_PATTERNS = {
     json: /\$json(\.[a-zA-Z_][\w]*|\["[^"]+"\]|\['[^']+'\]|\[\d+\])*/g,
     node: /\$node\["([^"]+)"\]\.json/g,
@@ -89,11 +107,12 @@ export class ExpressionValidator {
   private static checkSyntaxErrors(expression: string): string[] {
     const errors: string[] = [];
 
-    // Check for unmatched brackets
-    const openBrackets = (expression.match(/\{\{/g) || []).length;
-    const closeBrackets = (expression.match(/\}\}/g) || []).length;
-    
-    if (openBrackets !== closeBrackets) {
+    // Bracket-balance errors only apply to values n8n actually evaluates
+    // (leading '='). n8n pairs each '{{' with the next '}}' and renders any
+    // leftover braces as literal text (JSON bodies, Graph-API field syntax,
+    // stray '}}' all run fine), so only a dangling '{{' with no closing '}}'
+    // after it is flagged.
+    if (expression.startsWith('=') && hasDanglingOpenBracket(expression)) {
       errors.push('Unmatched expression brackets {{ }}');
     }
 
@@ -115,17 +134,15 @@ export class ExpressionValidator {
   }
 
   /**
-   * Extract all expressions from a string
+   * Extract all expressions from a string.
+   *
+   * Uses the shared linear-time `extractBracketExpressions` helper
+   * instead of the old `EXPRESSION_PATTERN.exec()` loop to avoid
+   * CodeQL js/polynomial-redos. Strips the `{{` / `}}` delimiters
+   * and trims whitespace to preserve the previous contract.
    */
   private static extractExpressions(text: string): string[] {
-    const expressions: string[] = [];
-    let match;
-    
-    while ((match = this.EXPRESSION_PATTERN.exec(text)) !== null) {
-      expressions.push(match[1].trim());
-    }
-    
-    return expressions;
+    return extractBracketExpressions(text).map(match => match.slice(2, -2).trim());
   }
 
   /**
@@ -145,15 +162,6 @@ export class ExpressionValidator {
       if (!context.hasInputData && !context.isInLoop) {
         result.warnings.push(
           'Using $json but node might not have input data'
-        );
-      }
-
-      // Check for suspicious property names that might be test/invalid data
-      const fullMatch = match[0];
-      if (fullMatch.includes('.invalid') || fullMatch.includes('.undefined') ||
-          fullMatch.includes('.null') || fullMatch.includes('.test')) {
-        result.warnings.push(
-          `Property access '${fullMatch}' looks suspicious - verify this property exists in your data`
         );
       }
     }
@@ -198,6 +206,34 @@ export class ExpressionValidator {
 
     // Check for common mistakes
     this.checkCommonMistakes(expr, result);
+    this.checkJmespathCalls(expr, result);
+  }
+
+  /**
+   * `$jmespath()` inside `{{ }}`: n8n swallows JMESPath parse errors there and the field
+   * resolves to null while the node reports success (#1114), so the query string gets the
+   * same static checks the Code-node validator applies.
+   */
+  private static checkJmespathCalls(expr: string, result: ExpressionValidationResult): void {
+    if (expr.length > this.MAX_JMESPATH_SCAN_LENGTH) return;
+    const seen = new Set<string>();
+    const report = (severity: 'error' | 'warning', text: string) => {
+      if (seen.has(text)) return;
+      seen.add(text);
+      (severity === 'error' ? result.errors : result.warnings).push(text);
+    };
+    for (const call of findJmespathCalls(expr)) {
+      if (call.queryIsFirstArgument) {
+        report('error', '$jmespath arguments are reversed: use $jmespath(data, "query"); n8n resolves the expression to null');
+        continue;
+      }
+      if (call.query === undefined) continue;
+      for (const finding of checkJmespathQuery(call.query)) {
+        // The silent null is expression-specific; a Code node surfaces the parse error.
+        const consequence = finding.severity === 'error' ? '; n8n resolves the expression to null instead of reporting the parse error' : '';
+        report(finding.severity, `${finding.message}${consequence}. ${finding.fix}`);
+      }
+    }
   }
 
   /**
@@ -214,40 +250,19 @@ export class ExpressionValidator {
     // - Inside word characters (e.g., myJson) - handled by (?<!\w)
     // - Inside bracket notation (e.g., ['json']) - handled by (?<![)
     // - After opening bracket or quote (e.g., "json" or ['json'])
+    // The words are checked outside string literals only: a JMESPath query over .all() items
+    // has to say `json.` because each item is a {json: …} wrapper (#1115).
     const missingPrefixPattern = /(?<![.$\w['])\b(json|node|input|items|workflow|execution)\b(?!\s*[:''])/;
-    if (expr.match(missingPrefixPattern)) {
+    if (blankStringLiterals(expr).match(missingPrefixPattern)) {
       result.warnings.push(
         'Possible missing $ prefix for variable (e.g., use $json instead of json)'
       );
     }
 
-    // Check for incorrect array access
-    if (expr.includes('$json[') && !expr.match(/\$json\[\d+\]/)) {
-      result.warnings.push(
-        'Array access should use numeric index: $json[0] or property access: $json.property'
-      );
-    }
-
-    // Check for Python-style property access
-    if (expr.match(/\$json\['[^']+'\]/)) {
-      result.warnings.push(
-        "Consider using dot notation: $json.property instead of $json['property']"
-      );
-    }
-
-    // Check for undefined/null access attempts
-    if (expr.match(/\?\./)) {
-      result.warnings.push(
-        'Optional chaining (?.) is not supported in n8n expressions'
-      );
-    }
-
-    // Check for template literals
-    if (expr.includes('${')) {
-      result.errors.push(
-        'Template literals ${} are not supported. Use string concatenation instead'
-      );
-    }
+    // Note: n8n's Tournament engine evaluates {{ }} content as full modern
+    // JavaScript — optional chaining, bracket access with any key, and
+    // backtick template literals with ${} interpolation are all supported
+    // (live-verified, issue #338). Do not flag them here.
   }
 
   /**
@@ -289,6 +304,32 @@ export class ExpressionValidator {
   }
 
   /**
+   * Detect bare n8n variable references missing {{ }} wrappers.
+   * Emits warnings since the value is technically valid as a literal string.
+   */
+  private static checkBareExpression(
+    value: string,
+    path: string,
+    result: ExpressionValidationResult
+  ): void {
+    if (value.includes('{{') || value.startsWith('=')) {
+      return;
+    }
+
+    const trimmed = value.trim();
+    for (const { pattern, name } of this.BARE_EXPRESSION_PATTERNS) {
+      if (pattern.test(trimmed)) {
+        result.warnings.push(
+          (path ? `${path}: ` : '') +
+          `Possible unwrapped expression: "${trimmed}" looks like an n8n ${name} reference. ` +
+          `Use "={{ ${trimmed} }}" to evaluate it as an expression.`
+        );
+        return;
+      }
+    }
+  }
+
+  /**
    * Recursively validate expressions in parameters
    */
   private static validateParametersRecursive(
@@ -307,6 +348,9 @@ export class ExpressionValidator {
     }
     
     if (typeof obj === 'string') {
+      // Detect bare expressions missing {{ }} wrappers
+      this.checkBareExpression(obj, path, result);
+
       if (obj.includes('{{')) {
         const validation = this.validateExpression(obj, context);
         
@@ -335,6 +379,11 @@ export class ExpressionValidator {
       });
     } else if (obj && typeof obj === 'object') {
       Object.entries(obj).forEach(([key, value]) => {
+        // Skip raw code fields — they contain JavaScript/Python source code,
+        // not n8n expressions, so bracket matching would produce false positives.
+        if (key === 'jsCode' || key === 'pythonCode' || key === 'functionCode') {
+          return;
+        }
         const newPath = path ? `${path}.${key}` : key;
         this.validateParametersRecursive(value, context, result, newPath, visited);
       });

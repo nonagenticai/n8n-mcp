@@ -12,6 +12,27 @@
 import { INodeParameters } from 'n8n-workflow';
 import { logger } from '../utils/logger';
 import { WorkflowNode } from '../types/n8n-api';
+import { FILTER_OPERATOR_TYPES, describeOperatorValue } from './n8n-validation';
+
+/** The keys a Switch can carry its rules under: `values` is the live one at 3.2+ (#1097). */
+const SWITCH_RULE_KEYS = ['values', 'rules'] as const;
+
+/** Legacy operator names that n8n no longer recognizes, mapped to their correct names. */
+const OPERATOR_CORRECTIONS: Record<string, string> = {
+  'isEmpty': 'empty',
+  'isNotEmpty': 'notEmpty',
+};
+
+/** Operators that take no right-hand value and require singleValue: true. */
+const UNARY_OPERATORS = new Set([
+  'true',
+  'false',
+  'isNumeric',
+  'empty',
+  'notEmpty',
+  'exists',
+  'notExists',
+]);
 
 /**
  * Sanitize a single node by adding required metadata
@@ -41,7 +62,7 @@ export function sanitizeWorkflowNodes(workflow: any): any {
 
   return {
     ...workflow,
-    nodes: workflow.nodes.map((node: any) => sanitizeNode(node))
+    nodes: workflow.nodes.map(sanitizeNode)
   };
 }
 
@@ -78,16 +99,31 @@ function sanitizeFilterBasedNode(
   if (nodeType === 'n8n-nodes-base.switch' && typeVersion >= 3.2) {
     if (sanitized.rules && typeof sanitized.rules === 'object') {
       const rules = sanitized.rules as any;
-      if (rules.rules && Array.isArray(rules.rules)) {
-        rules.rules = rules.rules.map((rule: any) => ({
-          ...rule,
-          conditions: sanitizeFilterConditions(rule.conditions)
-        }));
+      // Both keys, for the same reason the condition validator walks both: `values` is the one
+      // n8n reads at 3.2+ and the one most real workflows use (#1097). Sanitizing only `rules`
+      // meant an operator the validator now reports under `values` was never repaired on the
+      // way in, so the caller was told to retry a payload nothing would fix.
+      for (const key of SWITCH_RULE_KEYS) {
+        if (Array.isArray(rules[key])) {
+          rules[key] = rules[key].map(sanitizeSwitchRule);
+        }
       }
     }
   }
 
   return sanitized;
+}
+
+/**
+ * Leave an entry that is not a rule exactly as it arrived — repairing it would hide the
+ * malformed payload that validation reports (#1094). Arrays are excluded for that reason and
+ * not for a dereference: spreading [] yields {conditions: undefined}, which
+ * validateConditionNodeStructure no longer recognises as malformed.
+ */
+function sanitizeSwitchRule(rule: any): any {
+  return rule && typeof rule === 'object' && !Array.isArray(rule)
+    ? { ...rule, conditions: sanitizeFilterConditions(rule.conditions) }
+    : rule;
 }
 
 /**
@@ -121,9 +157,7 @@ function sanitizeFilterConditions(conditions: any): any {
 
   // Sanitize conditions array
   if (sanitized.conditions && Array.isArray(sanitized.conditions)) {
-    sanitized.conditions = sanitized.conditions.map((condition: any) =>
-      sanitizeCondition(condition)
-    );
+    sanitized.conditions = sanitized.conditions.map(sanitizeCondition);
   }
 
   return sanitized;
@@ -164,29 +198,28 @@ function sanitizeOperator(operator: any): any {
   const sanitized = { ...operator };
 
   // Fix common mistake: type field used for operation name
-  // WRONG: {type: "isNotEmpty"}
-  // RIGHT: {type: "string", operation: "isNotEmpty"}
+  // WRONG: {type: "notEmpty"}
+  // RIGHT: {type: "string", operation: "notEmpty"}
   if (sanitized.type && !sanitized.operation) {
-    // Check if type value looks like an operation (lowercase, no dots)
     const typeValue = sanitized.type as string;
     if (isOperationName(typeValue)) {
       logger.debug(`Fixing operator structure: converting type="${typeValue}" to operation`);
-
-      // Infer data type from operation
-      const dataType = inferDataType(typeValue);
-      sanitized.type = dataType;
+      sanitized.type = inferDataType(typeValue);
       sanitized.operation = typeValue;
     }
+  }
+
+  // Auto-correct legacy operator names to n8n-recognized names
+  if (sanitized.operation && OPERATOR_CORRECTIONS[sanitized.operation]) {
+    sanitized.operation = OPERATOR_CORRECTIONS[sanitized.operation];
   }
 
   // Set singleValue based on operator type
   if (sanitized.operation) {
     if (isUnaryOperator(sanitized.operation)) {
-      // Unary operators require singleValue: true
       sanitized.singleValue = true;
     } else {
-      // Binary operators should NOT have singleValue (or it should be false/undefined)
-      // Remove it to prevent UI errors
+      // Binary operators should NOT have singleValue — remove it to prevent UI errors
       delete sanitized.singleValue;
     }
   }
@@ -200,8 +233,10 @@ function sanitizeOperator(operator: any): any {
 function isOperationName(value: string): boolean {
   // Operation names are lowercase and don't contain dots
   // Data types are: string, number, boolean, dateTime, array, object
-  const dataTypes = ['string', 'number', 'boolean', 'dateTime', 'array', 'object'];
-  return !dataTypes.includes(value) && /^[a-z][a-zA-Z]*$/.test(value);
+  // FILTER_OPERATOR_TYPES, not a copy: without `any` here the repair below rewrote
+  // {type: "any"} into {type: "string", operation: "any"}, inventing an operation n8n has no
+  // such thing as and hiding the missing-operation error on the way to n8n (#1097).
+  return !FILTER_OPERATOR_TYPES.includes(value) && /^[a-z][a-zA-Z]*$/.test(value);
 }
 
 /**
@@ -209,21 +244,27 @@ function isOperationName(value: string): boolean {
  */
 function inferDataType(operation: string): string {
   // Boolean operations
-  const booleanOps = ['true', 'false', 'isEmpty', 'isNotEmpty'];
+  const booleanOps = ['true', 'false'];
   if (booleanOps.includes(operation)) {
     return 'boolean';
   }
 
-  // Number operations
+  // Number operations (partial match to catch variants like "greaterThan" containing "gt")
   const numberOps = ['isNumeric', 'gt', 'gte', 'lt', 'lte'];
   if (numberOps.some(op => operation.includes(op))) {
     return 'number';
   }
 
-  // Date operations
+  // Date operations (partial match to catch variants like "isAfter" containing "after")
   const dateOps = ['after', 'before', 'afterDate', 'beforeDate'];
   if (dateOps.some(op => operation.includes(op))) {
     return 'dateTime';
+  }
+
+  // Object operations: empty/notEmpty/exists/notExists are generic object-level checks
+  const objectOps = ['empty', 'notEmpty', 'exists', 'notExists'];
+  if (objectOps.includes(operation)) {
+    return 'object';
   }
 
   // Default to string
@@ -234,14 +275,7 @@ function inferDataType(operation: string): string {
  * Check if operator is unary (requires singleValue: true)
  */
 function isUnaryOperator(operation: string): boolean {
-  const unaryOps = [
-    'isEmpty',
-    'isNotEmpty',
-    'true',
-    'false',
-    'isNumeric'
-  ];
-  return unaryOps.includes(operation);
+  return UNARY_OPERATORS.has(operation);
 }
 
 /**
@@ -286,19 +320,26 @@ export function validateNodeMetadata(node: WorkflowNode): string[] {
     }
   }
 
-  // Check Switch node
+  // Check Switch node, under both rule keys - `values` is the one n8n reads at 3.2+ (#1097)
   if (node.type === 'n8n-nodes-base.switch') {
     const rules = (node.parameters.rules as any);
-    if (rules?.rules && Array.isArray(rules.rules)) {
-      for (let i = 0; i < rules.rules.length; i++) {
-        const rule = rules.rules[i];
+    for (const key of SWITCH_RULE_KEYS) {
+      const collection = rules?.[key];
+      if (!Array.isArray(collection)) continue;
+
+      for (let i = 0; i < collection.length; i++) {
+        const rule = collection[i];
+        // typeof [] === 'object', so an array slips a plain typeof check and gets reported as a
+        // rule missing its options - the condition validator already names it precisely (#1097).
+        if (!rule || typeof rule !== 'object' || Array.isArray(rule)) continue;
+
         if (!rule.conditions?.options) {
-          issues.push(`Missing rules.rules[${i}].conditions.options`);
+          issues.push(`Missing rules.${key}[${i}].conditions.options`);
         } else {
           const required = ['version', 'leftValue', 'typeValidation', 'caseSensitive'];
           for (const field of required) {
             if (!(field in rule.conditions.options)) {
-              issues.push(`Missing rules.rules[${i}].conditions.options.${field}`);
+              issues.push(`Missing rules.${key}[${i}].conditions.options.${field}`);
             }
           }
         }
@@ -308,8 +349,8 @@ export function validateNodeMetadata(node: WorkflowNode): string[] {
           for (let j = 0; j < rule.conditions.conditions.length; j++) {
             const condition = rule.conditions.conditions[j];
             const operatorIssues = validateOperator(
-              condition.operator,
-              `rules.rules[${i}].conditions.conditions[${j}].operator`
+              condition?.operator,
+              `rules.${key}[${i}].conditions.conditions[${j}].operator`
             );
             issues.push(...operatorIssues);
           }
@@ -334,8 +375,8 @@ function validateOperator(operator: any, path: string): string[] {
 
   if (!operator.type) {
     issues.push(`${path}: missing required field 'type'`);
-  } else if (!['string', 'number', 'boolean', 'dateTime', 'array', 'object'].includes(operator.type)) {
-    issues.push(`${path}: invalid type "${operator.type}" (must be data type, not operation)`);
+  } else if (!FILTER_OPERATOR_TYPES.includes(operator.type)) {
+    issues.push(`${path}: invalid type ${describeOperatorValue(operator.type)} (must be data type, not operation)`);
   }
 
   if (!operator.operation) {
@@ -347,12 +388,12 @@ function validateOperator(operator: any, path: string): string[] {
     if (isUnaryOperator(operator.operation)) {
       // Unary operators MUST have singleValue: true
       if (operator.singleValue !== true) {
-        issues.push(`${path}: unary operator "${operator.operation}" requires singleValue: true`);
+        issues.push(`${path}: unary operator ${describeOperatorValue(operator.operation)} requires singleValue: true`);
       }
     } else {
       // Binary operators should NOT have singleValue
       if (operator.singleValue === true) {
-        issues.push(`${path}: binary operator "${operator.operation}" should not have singleValue: true (only unary operators need this)`);
+        issues.push(`${path}: binary operator ${describeOperatorValue(operator.operation)} should not have singleValue: true (only unary operators need this)`);
       }
     }
   }

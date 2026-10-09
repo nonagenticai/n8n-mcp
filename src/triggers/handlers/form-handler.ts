@@ -267,6 +267,13 @@ export class FormHandler extends BaseTriggerHandler<FormTriggerInput> {
         return this.errorResponse(input, `SSRF protection: ${validation.reason}`, startTime);
       }
 
+      // SECURITY (GHSA-cmrh-wvq6-wm9r): pin transport to validated IP.
+      const pinned = validation.address && validation.family
+        ? SSRFProtection.createPinnedAgents(
+            validation.addresses ?? [{ address: validation.address, family: validation.family }]
+          )
+        : undefined;
+
       // Build multipart/form-data (required by n8n form triggers)
       const formData = new FormData();
       const warnings: string[] = [];
@@ -405,6 +412,10 @@ export class FormHandler extends BaseTriggerHandler<FormTriggerInput> {
         data: formData,
         timeout: input.timeout || (input.waitForResponse !== false ? 120000 : 30000),
         validateStatus: (status) => status < 500,
+        // SECURITY (GHSA-8g7g-hmwm-6rv2): no redirect-following on validated URLs.
+        maxRedirects: 0,
+        httpAgent: pinned?.httpAgent,
+        httpsAgent: pinned?.httpsAgent,
       };
 
       // Make the request
@@ -434,7 +445,16 @@ export class FormHandler extends BaseTriggerHandler<FormTriggerInput> {
 
       return result;
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      let errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      if (!errorMessage) {
+        // An AggregateError from a multi-address connection failure
+        // (autoSelectFamily across the pinned set) has an empty message;
+        // summarize its members instead of reporting nothing.
+        const members = (error as any)?.errors ?? (error as any)?.cause?.errors;
+        errorMessage = (Array.isArray(members)
+          ? members.map((m: any) => m?.code || m?.message).filter(Boolean).join(', ')
+          : '') || 'Connection failed';
+      }
 
       // Try to extract execution ID from error if available
       const errorDetails = (error as any)?.response?.data;

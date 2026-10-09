@@ -146,42 +146,6 @@ describe('Unified get_node Tool', () => {
         JSON.stringify(['oldAuth']),
         JSON.stringify(['newAuth'])
       );
-
-      // Add property change data for version comparison
-      const changeInsertStmt = db.prepare(`
-        INSERT INTO version_property_changes (
-          node_type, from_version, to_version, property_name,
-          change_type, is_breaking, old_value, new_value,
-          migration_hint, auto_migratable, migration_strategy
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-
-      changeInsertStmt.run(
-        'nodes-base.httpRequest',
-        '4.1',
-        '4.2',
-        'authentication',
-        'type_changed',
-        1,
-        'basic',
-        'oauth2',
-        'Update authentication configuration',
-        0,
-        null
-      );
-      changeInsertStmt.run(
-        'nodes-base.httpRequest',
-        '4.1',
-        '4.2',
-        'timeout',
-        'added',
-        0,
-        null,
-        '30000',
-        null,
-        1,
-        'default_value'
-      );
     }
   });
 
@@ -251,6 +215,48 @@ describe('Unified get_node Tool', () => {
       // Test with langchain package
       const result3 = await (server as any).getNode('agent', 'minimal', 'info');
       expect(result3.nodeType).toBe('nodes-langchain.agent');
+    });
+  });
+
+  describe('Retired parameter vocabulary (#1051)', () => {
+    const call = (args: Record<string, unknown>) =>
+      (server as any).executeTool('get_node', { nodeType: 'nodes-base.httpRequest', ...args });
+
+    it('serves mode=essentials as info at standard detail', async () => {
+      const [aliased, canonical] = await Promise.all([
+        call({ mode: 'essentials' }),
+        call({ mode: 'info', detail: 'standard' }),
+      ]);
+      expect(aliased).toEqual(canonical);
+    });
+
+    it('serves mode=full as info at full detail', async () => {
+      const [aliased, canonical] = await Promise.all([
+        call({ mode: 'full' }),
+        call({ detail: 'full' }),
+      ]);
+      expect(aliased).toEqual(canonical);
+      expect(aliased.properties.length).toBe(canonical.properties.length);
+    });
+
+    it('serves detail=summary as minimal', async () => {
+      const [aliased, canonical] = await Promise.all([
+        call({ detail: 'summary' }),
+        call({ detail: 'minimal' }),
+      ]);
+      expect(aliased).toEqual(canonical);
+    });
+
+    it('routes mode=properties to search_properties and still requires propertyQuery', async () => {
+      await expect(call({ mode: 'properties' })).rejects.toThrow('propertyQuery is required for mode=search_properties');
+      const result = await call({ mode: 'properties', propertyQuery: 'url' });
+      expect(result).toEqual(await call({ mode: 'search_properties', propertyQuery: 'url' }));
+    });
+
+    it('still rejects values that are not aliases', async () => {
+      await expect(call({ mode: 'schema' })).rejects.toThrow('Invalid mode "schema". Valid options: info, docs, search_properties, versions, compare, breaking, migrations');
+      await expect(call({ detail: 'huge' })).rejects.toThrow('Invalid detail level "huge"');
+      await expect(call({ mode: 42 })).rejects.toThrow('Invalid mode "42"');
     });
   });
 
@@ -538,7 +544,10 @@ describe('Unified get_node Tool', () => {
       // Webhook node has no version history in our test data
       expect(result.totalVersions).toBe(0);
       expect(result.available).toBe(false);
-      expect(result.message).toBeDefined();
+      // Unavailable shape surfaces the reason so callers can tell
+      // "no data" apart from "no changes" (regression for QA #1/#12).
+      expect(result.reason).toBeDefined();
+      expect(result.reason).toMatch(/not populated/i);
     });
   });
 
@@ -599,6 +608,12 @@ describe('Unified get_node Tool', () => {
 
       expect(result.fromVersion).toBe('4.1');
       expect(result.toVersion).toBe('4.2');
+    });
+
+    it('should reject a version that is not recorded for the node', async () => {
+      await expect(
+        (server as any).getNode('nodes-base.httpRequest', 'standard', 'compare', false, false, '9', '4.2')
+      ).rejects.toThrow(/version "9" is not a recorded version of nodes-base\.httpRequest \(recorded: (4\.1, 4\.2|4\.2, 4\.1)\)/);
     });
 
     it('should return change details in compare mode', async () => {
@@ -703,7 +718,8 @@ describe('Unified get_node Tool', () => {
         '4.1'
       );
 
-      expect(result.toVersion).toBe('latest');
+      // Resolves to the current max version seeded above rather than the literal 'latest'
+      expect(result.toVersion).toBe('4.2');
     });
   });
 
@@ -983,7 +999,7 @@ describe('Unified get_node Tool', () => {
       expect(cacheSetSpy).toHaveBeenCalledWith(
         expect.any(String),
         expect.any(Object),
-        86400000 // 24 hours in milliseconds
+        86400 // 24 hours in seconds (SimpleCache.set treats the TTL as seconds)
       );
     });
 

@@ -9,6 +9,7 @@ import { NodeRepository } from '../database/node-repository';
 import { N8nApiClient } from './n8n-api-client';
 import { WorkflowValidator } from './workflow-validator';
 import { EnhancedConfigValidator } from './enhanced-config-validator';
+import { N8nApiError } from '../utils/n8n-errors';
 
 export interface WorkflowVersion {
   id: number;
@@ -44,6 +45,21 @@ export interface RestoreResult {
   backupCreated: boolean;
   backupVersionId?: number;
   validationErrors?: string[];
+  /**
+   * Canvas groups adjusted to make the restore land — a snapshot can predate a node deletion, and
+   * n8n validates groups on write. The graph is restored either way; this says what else changed.
+   */
+  warnings?: string[];
+  /**
+   * Machine-readable failure code (e.g. 'PUBLISH_FORBIDDEN' — n8n 2.39+ refused to
+   * publish the restore PUT). Callers should branch on this rather than parsing `message`.
+   */
+  code?: string;
+  /**
+   * The versionId of the draft n8n saved the restored content as, when the restore PUT
+   * was saved as an unpublished draft (PUBLISH_FORBIDDEN) instead of being published.
+   */
+  draftVersionId?: string;
 }
 
 export interface BackupResult {
@@ -69,6 +85,13 @@ export interface WorkflowStorageInfo {
   lastBackup: string;
 }
 
+/**
+ * The tail of the error `compareVersions` throws when a snapshot belongs to a
+ * different workflow. Exported so callers can tell that caller mistake from a
+ * storage failure without re-typing the wording.
+ */
+export const VERSION_OWNERSHIP_ERROR_PREFIX = 'does not belong to workflow';
+
 export interface VersionDiff {
   versionId1: number;
   versionId2: number;
@@ -79,6 +102,8 @@ export interface VersionDiff {
   modifiedNodes: string[];
   connectionChanges: number;
   settingChanges: any;
+  /** 1 when the canvas grouping differs, 0 otherwise. Without this a group-only change looks identical. */
+  nodeGroupChanges: number;
 }
 
 /**
@@ -89,7 +114,10 @@ export class WorkflowVersioningService {
 
   constructor(
     private nodeRepository: NodeRepository,
-    private apiClient?: N8nApiClient
+    private apiClient?: N8nApiClient,
+    // Tenant scope for all version operations (GHSA-j6r7-6fhx-77wx). Derived
+    // via getInstanceScopeId; '' is the single tenant for single-user mode.
+    private instanceId: string = ''
   ) {}
 
   /**
@@ -107,11 +135,12 @@ export class WorkflowVersioningService {
     }
   ): Promise<BackupResult> {
     // Get current max version number
-    const versions = this.nodeRepository.getWorkflowVersions(workflowId, 1);
+    const versions = this.nodeRepository.getWorkflowVersions(workflowId, this.instanceId, 1);
     const nextVersion = versions.length > 0 ? versions[0].versionNumber + 1 : 1;
 
     // Create new version
     const versionId = this.nodeRepository.createWorkflowVersion({
+      instanceId: this.instanceId,
       workflowId,
       versionNumber: nextVersion,
       workflowName: workflow.name || 'Unnamed Workflow',
@@ -125,7 +154,8 @@ export class WorkflowVersioningService {
     // Auto-prune to keep max 10 versions
     const pruned = this.nodeRepository.pruneWorkflowVersions(
       workflowId,
-      this.DEFAULT_MAX_VERSIONS
+      this.DEFAULT_MAX_VERSIONS,
+      this.instanceId
     );
 
     return {
@@ -142,7 +172,7 @@ export class WorkflowVersioningService {
    * Get version history for a workflow
    */
   async getVersionHistory(workflowId: string, limit: number = 10): Promise<VersionInfo[]> {
-    const versions = this.nodeRepository.getWorkflowVersions(workflowId, limit);
+    const versions = this.nodeRepository.getWorkflowVersions(workflowId, this.instanceId, limit);
 
     return versions.map(v => ({
       id: v.id,
@@ -161,7 +191,7 @@ export class WorkflowVersioningService {
    * Get a specific workflow version
    */
   async getVersion(versionId: number): Promise<WorkflowVersion | null> {
-    return this.nodeRepository.getWorkflowVersion(versionId);
+    return this.nodeRepository.getWorkflowVersion(versionId, this.instanceId);
   }
 
   /**
@@ -187,10 +217,10 @@ export class WorkflowVersioningService {
     let versionToRestore: WorkflowVersion | null = null;
 
     if (versionId) {
-      versionToRestore = this.nodeRepository.getWorkflowVersion(versionId);
+      versionToRestore = this.nodeRepository.getWorkflowVersion(versionId, this.instanceId);
     } else {
       // Get latest backup
-      versionToRestore = this.nodeRepository.getLatestWorkflowVersion(workflowId);
+      versionToRestore = this.nodeRepository.getLatestWorkflowVersion(workflowId, this.instanceId);
     }
 
     if (!versionToRestore) {
@@ -253,7 +283,10 @@ export class WorkflowVersioningService {
 
     // Restore the workflow
     try {
-      await this.apiClient.updateWorkflow(workflowId, versionToRestore.workflowSnapshot);
+      const warnings: string[] = [];
+      await this.apiClient.updateWorkflow(workflowId, versionToRestore.workflowSnapshot, {
+        onWarning: message => warnings.push(message)
+      });
 
       return {
         success: true,
@@ -262,9 +295,27 @@ export class WorkflowVersioningService {
         fromVersion: backupResult.versionNumber,
         toVersionId: versionToRestore.id,
         backupCreated: true,
-        backupVersionId: backupResult.versionId
+        backupVersionId: backupResult.versionId,
+        ...(warnings.length > 0 ? { warnings } : {})
       };
     } catch (error: any) {
+      // PUBLISH_FORBIDDEN (n8n 2.39+): the restore PUT was saved as a draft, not
+      // published, because the caller may edit but not publish. Say so plainly
+      // rather than surfacing n8n's raw "saved as a draft" message under a
+      // "Failed to restore" prefix, which reads as if nothing happened at all.
+      if (error instanceof N8nApiError && error.code === 'PUBLISH_FORBIDDEN') {
+        const body = error.details as { reason?: string; versionId?: string } | undefined;
+        return {
+          success: false,
+          message: `Failed to restore workflow: the content was saved as a draft but not published${body?.reason ? ` (${body.reason})` : ''}. The published version is unchanged. The draft now holds the restored snapshot, so publishing it completes the restore.`,
+          workflowId,
+          toVersionId: versionToRestore.id,
+          backupCreated: true,
+          backupVersionId: backupResult.versionId,
+          code: error.code,
+          ...(body?.versionId ? { draftVersionId: body.versionId } : {})
+        };
+      }
       return {
         success: false,
         message: `Failed to restore workflow: ${error.message}`,
@@ -280,7 +331,7 @@ export class WorkflowVersioningService {
    * Delete a specific version
    */
   async deleteVersion(versionId: number): Promise<{ success: boolean; message: string }> {
-    const version = this.nodeRepository.getWorkflowVersion(versionId);
+    const version = this.nodeRepository.getWorkflowVersion(versionId, this.instanceId);
 
     if (!version) {
       return {
@@ -289,7 +340,7 @@ export class WorkflowVersioningService {
       };
     }
 
-    this.nodeRepository.deleteWorkflowVersion(versionId);
+    this.nodeRepository.deleteWorkflowVersion(versionId, this.instanceId);
 
     return {
       success: true,
@@ -301,7 +352,7 @@ export class WorkflowVersioningService {
    * Delete all versions for a workflow
    */
   async deleteAllVersions(workflowId: string): Promise<{ deleted: number; message: string }> {
-    const count = this.nodeRepository.getWorkflowVersionCount(workflowId);
+    const count = this.nodeRepository.getWorkflowVersionCount(workflowId, this.instanceId);
 
     if (count === 0) {
       return {
@@ -310,7 +361,7 @@ export class WorkflowVersioningService {
       };
     }
 
-    const deleted = this.nodeRepository.deleteWorkflowVersionsByWorkflowId(workflowId);
+    const deleted = this.nodeRepository.deleteWorkflowVersionsByWorkflowId(workflowId, this.instanceId);
 
     return {
       deleted,
@@ -325,37 +376,17 @@ export class WorkflowVersioningService {
     workflowId: string,
     maxVersions: number = 10
   ): Promise<{ pruned: number; remaining: number }> {
-    const pruned = this.nodeRepository.pruneWorkflowVersions(workflowId, maxVersions);
-    const remaining = this.nodeRepository.getWorkflowVersionCount(workflowId);
+    const pruned = this.nodeRepository.pruneWorkflowVersions(workflowId, maxVersions, this.instanceId);
+    const remaining = this.nodeRepository.getWorkflowVersionCount(workflowId, this.instanceId);
 
     return { pruned, remaining };
-  }
-
-  /**
-   * Truncate entire workflow_versions table
-   * Requires explicit confirmation
-   */
-  async truncateAllVersions(confirm: boolean): Promise<{ deleted: number; message: string }> {
-    if (!confirm) {
-      return {
-        deleted: 0,
-        message: 'Truncate operation not confirmed - no action taken'
-      };
-    }
-
-    const deleted = this.nodeRepository.truncateWorkflowVersions();
-
-    return {
-      deleted,
-      message: `Truncated workflow_versions table - deleted ${deleted} version(s)`
-    };
   }
 
   /**
    * Get storage statistics
    */
   async getStorageStats(): Promise<StorageStats> {
-    const stats = this.nodeRepository.getVersionStorageStats();
+    const stats = this.nodeRepository.getVersionStorageStats(this.instanceId);
 
     return {
       totalVersions: stats.totalVersions,
@@ -373,14 +404,24 @@ export class WorkflowVersioningService {
   }
 
   /**
-   * Compare two versions
+   * Compare two versions of one workflow.
+   *
+   * `workflowId` is required: version ids are global to the instance scope, so
+   * without it a caller could diff two unrelated workflows' snapshots against
+   * each other and read a workflow it never named.
    */
-  async compareVersions(versionId1: number, versionId2: number): Promise<VersionDiff> {
-    const v1 = this.nodeRepository.getWorkflowVersion(versionId1);
-    const v2 = this.nodeRepository.getWorkflowVersion(versionId2);
+  async compareVersions(versionId1: number, versionId2: number, workflowId: string): Promise<VersionDiff> {
+    const v1 = this.nodeRepository.getWorkflowVersion(versionId1, this.instanceId);
+    const v2 = this.nodeRepository.getWorkflowVersion(versionId2, this.instanceId);
 
     if (!v1 || !v2) {
       throw new Error(`One or both versions not found: ${versionId1}, ${versionId2}`);
+    }
+
+    for (const version of [v1, v2]) {
+      if (version.workflowId !== workflowId) {
+        throw new Error(`Version ${version.id} ${VERSION_OWNERSHIP_ERROR_PREFIX} ${workflowId}`);
+      }
     }
 
     // Compare nodes
@@ -412,6 +453,11 @@ export class WorkflowVersioningService {
     const settings2 = v2.workflowSnapshot.settings || {};
     const settingChanges = this.diffObjects(settings1, settings2);
 
+    // Compare canvas groups
+    const groups1Str = JSON.stringify(v1.workflowSnapshot.nodeGroups || []);
+    const groups2Str = JSON.stringify(v2.workflowSnapshot.nodeGroups || []);
+    const nodeGroupChanges = groups1Str !== groups2Str ? 1 : 0;
+
     return {
       versionId1,
       versionId2,
@@ -421,7 +467,8 @@ export class WorkflowVersioningService {
       removedNodes,
       modifiedNodes,
       connectionChanges,
-      settingChanges
+      settingChanges,
+      nodeGroupChanges
     };
   }
 
