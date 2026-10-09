@@ -5,7 +5,7 @@
  * These structures define the expected data format, JavaScript type,
  * validation rules, and examples for each property type.
  *
- * Based on n8n-workflow v1.120.3 NodePropertyTypes
+ * Based on n8n-workflow v2.31.3 NodePropertyTypes
  *
  * @module constants/type-structures
  * @since 2.23.0
@@ -15,7 +15,7 @@ import type { NodePropertyTypes } from 'n8n-workflow';
 import type { TypeStructure } from '../types/type-structures';
 
 /**
- * Complete type structure definitions for all 22 NodePropertyTypes
+ * Complete type structure definitions for all 24 NodePropertyTypes
  *
  * Each entry defines:
  * - type: Category (primitive/object/collection/special)
@@ -605,6 +605,46 @@ export const TYPE_STRUCTURES: Record<NodePropertyTypes, TypeStructure> = {
 		],
 	},
 
+	agentSelector: {
+		type: 'special',
+		jsType: 'object',
+		description: 'Resource locator for selecting an agent to send a message to',
+		structure: {
+			properties: {
+				mode: {
+					type: 'string',
+					description: 'How the agent is specified',
+					enum: ['list', 'id'],
+					required: true,
+				},
+				value: {
+					type: 'string',
+					description: 'The agent identifier',
+					required: true,
+				},
+			},
+			required: ['mode', 'value'],
+		},
+		example: {
+			mode: 'list',
+			value: 'agent-123',
+		},
+		examples: [
+			{ mode: 'id', value: 'agent-123' },
+			{ mode: 'id', value: '{{ $json.agentId }}' },
+		],
+		validation: {
+			allowEmpty: false,
+			allowExpressions: true,
+		},
+		notes: [
+			'Resource locator shape, validated like resourceLocator',
+			'Used in the Message an Agent node',
+			"n8n's editor also writes an __rl: true marker, which is not required",
+			'Added in n8n 2.31',
+		],
+	},
+
 	curlImport: {
 		type: 'special',
 		jsType: 'string',
@@ -618,6 +658,23 @@ export const TYPE_STRUCTURES: Record<NodePropertyTypes, TypeStructure> = {
 			'Parses cURL command to populate fields',
 			'Used in HTTP Request node',
 			'One-time import feature',
+		],
+	},
+
+	icon: {
+		type: 'primitive',
+		jsType: 'string',
+		description: 'Icon identifier for visual representation',
+		example: 'fa:envelope',
+		examples: ['fa:envelope', 'fa:user', 'fa:cog', 'file:slack.svg'],
+		validation: {
+			allowEmpty: false,
+			allowExpressions: false,
+		},
+		notes: [
+			'References icon by name or file path',
+			'Supports Font Awesome icons (fa:) and file paths (file:)',
+			'Used for visual customization in UI',
 		],
 	},
 };

@@ -9,6 +9,7 @@
 
 import { z } from 'zod';
 import axios, { AxiosRequestConfig } from 'axios';
+import { randomUUID } from 'crypto';
 import { Workflow } from '../../types/n8n-api';
 import {
   TriggerType,
@@ -35,10 +36,14 @@ const chatInputSchema = z.object({
 });
 
 /**
- * Generate a unique session ID
+ * Generate a unique, unguessable session ID.
+ *
+ * Uses `crypto.randomUUID` (CSPRNG, 122 bits of entropy) rather than
+ * `Math.random` so an attacker observing one session ID cannot predict
+ * another. Addresses CodeQL js/insecure-randomness.
  */
 function generateSessionId(): string {
-  return `session_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
+  return `session_${Date.now()}_${randomUUID()}`;
 }
 
 /**
@@ -84,6 +89,13 @@ export class ChatHandler extends BaseTriggerHandler<ChatTriggerInput> {
         return this.errorResponse(input, `SSRF protection: ${validation.reason}`, startTime);
       }
 
+      // SECURITY (GHSA-cmrh-wvq6-wm9r): pin transport to validated IP.
+      const pinned = validation.address && validation.family
+        ? SSRFProtection.createPinnedAgents(
+            validation.addresses ?? [{ address: validation.address, family: validation.family }]
+          )
+        : undefined;
+
       // Generate or use provided session ID
       const sessionId = input.sessionId || generateSessionId();
 
@@ -107,6 +119,10 @@ export class ChatHandler extends BaseTriggerHandler<ChatTriggerInput> {
         data: chatPayload,
         timeout: input.timeout || (input.waitForResponse !== false ? 120000 : 30000),
         validateStatus: (status) => status < 500,
+        // SECURITY (GHSA-8g7g-hmwm-6rv2): no redirect-following on validated URLs.
+        maxRedirects: 0,
+        httpAgent: pinned?.httpAgent,
+        httpsAgent: pinned?.httpsAgent,
       };
 
       // Make the request (sync mode - no streaming)
@@ -125,7 +141,16 @@ export class ChatHandler extends BaseTriggerHandler<ChatTriggerInput> {
         },
       });
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      let errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      if (!errorMessage) {
+        // An AggregateError from a multi-address connection failure
+        // (autoSelectFamily across the pinned set) has an empty message;
+        // summarize its members instead of reporting nothing.
+        const members = (error as any)?.errors ?? (error as any)?.cause?.errors;
+        errorMessage = (Array.isArray(members)
+          ? members.map((m: any) => m?.code || m?.message).filter(Boolean).join(', ')
+          : '') || 'Connection failed';
+      }
 
       // Try to extract execution ID from error if available
       const errorDetails = (error as any)?.response?.data;

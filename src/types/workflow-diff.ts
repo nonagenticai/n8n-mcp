@@ -17,7 +17,10 @@ export interface AddNodeOperation extends DiffOperation {
   node: Partial<WorkflowNode> & {
     name: string; // Name is required
     type: string; // Type is required
-    position: [number, number]; // Position is required
+    // Position is NOT required: a batch may add a node and place it with a later moveNode,
+    // which applies cleanly today. A node that never gets one is caught by the post-apply
+    // structure validation, not by the operation validator.
+    position?: [number, number];
   };
 }
 
@@ -53,6 +56,19 @@ export interface DisableNodeOperation extends DiffOperation {
   type: 'disableNode';
   nodeId?: string;
   nodeName?: string;
+}
+
+export interface PatchNodeFieldOperation extends DiffOperation {
+  type: 'patchNodeField';
+  nodeId?: string;
+  nodeName?: string;
+  fieldPath: string;          // Dot-notation path, e.g. "parameters.jsCode"
+  patches: Array<{
+    find: string;
+    replace: string;
+    replaceAll?: boolean;     // Default: false. Replace all occurrences.
+    regex?: boolean;          // Default: false. Treat find as a regex pattern.
+  }>;
 }
 
 // Connection Operations
@@ -104,6 +120,27 @@ export interface UpdateNameOperation extends DiffOperation {
   name: string;
 }
 
+/**
+ * Replace the workflow's canvas groups (n8n 2.28+). Full replacement, like replaceConnections:
+ * pass every group you want to keep, or an empty array to ungroup everything.
+ *
+ * Members are addressed by name or by ID: supply exactly one populated list per group. Sending both
+ * with one of them empty is accepted (the populated one wins) because that shape is common in
+ * generated payloads; sending both populated is rejected as ambiguous. n8n itself decides whether
+ * the resulting shape is groupable (a connected run, no trigger inside); its rejection is returned
+ * verbatim rather than second-guessed here.
+ */
+export interface SetNodeGroupsOperation extends DiffOperation {
+  type: 'setNodeGroups';
+  nodeGroups: Array<{
+    id?: string;          // Generated when omitted
+    name: string;
+    nodeNames?: string[]; // Member node names
+    nodeIds?: string[];   // Member node IDs
+    description?: string; // n8n 2.32+ only; silently dropped on older instances
+  }>;
+}
+
 export interface AddTagOperation extends DiffOperation {
   type: 'addTag';
   tag: string;
@@ -124,6 +161,22 @@ export interface DeactivateWorkflowOperation extends DiffOperation {
   // No additional properties needed - just deactivates the workflow
 }
 
+export interface TransferWorkflowOperation extends DiffOperation {
+  type: 'transferWorkflow';
+  destinationProjectId: string;
+}
+
+/**
+ * Move the workflow into a folder, or to the project root (n8n 2.32+).
+ * n8n's PUT schema treats the field as write-only: null means project root,
+ * a string means the target folder ID. Instances older than 2.32 reject the
+ * field outright, which surfaces as a 400 naming parentFolderId.
+ */
+export interface MoveToFolderOperation extends DiffOperation {
+  type: 'moveToFolder';
+  parentFolderId: string | null;
+}
+
 // Connection Cleanup Operations
 export interface CleanStaleConnectionsOperation extends DiffOperation {
   type: 'cleanStaleConnections';
@@ -134,11 +187,14 @@ export interface ReplaceConnectionsOperation extends DiffOperation {
   type: 'replaceConnections';
   connections: {
     [nodeName: string]: {
+      // A null branch is n8n's own "nothing wired to this output" (#1096). The runtime accepts
+      // one here so a caller can send back a shape it read from n8n; without it on the type, a
+      // TypeScript caller could only express that payload through a cast.
       [outputName: string]: Array<Array<{
         node: string;
         type: string;
         index: number;
-      }>>;
+      }> | null>;
     };
   };
 }
@@ -148,6 +204,7 @@ export type WorkflowDiffOperation =
   | AddNodeOperation
   | RemoveNodeOperation
   | UpdateNodeOperation
+  | PatchNodeFieldOperation
   | MoveNodeOperation
   | EnableNodeOperation
   | DisableNodeOperation
@@ -156,12 +213,15 @@ export type WorkflowDiffOperation =
   | RewireConnectionOperation
   | UpdateSettingsOperation
   | UpdateNameOperation
+  | SetNodeGroupsOperation
   | AddTagOperation
   | RemoveTagOperation
   | ActivateWorkflowOperation
   | DeactivateWorkflowOperation
   | CleanStaleConnectionsOperation
-  | ReplaceConnectionsOperation;
+  | ReplaceConnectionsOperation
+  | TransferWorkflowOperation
+  | MoveToFolderOperation;
 
 // Main diff request structure
 export interface WorkflowDiffRequest {
@@ -190,6 +250,15 @@ export interface WorkflowDiffResult {
   staleConnectionsRemoved?: Array<{ from: string; to: string }>; // For cleanStaleConnections operation
   shouldActivate?: boolean; // Flag to activate workflow after update (for activateWorkflow operation)
   shouldDeactivate?: boolean; // Flag to deactivate workflow after update (for deactivateWorkflow operation)
+  tagsToAdd?: string[];
+  tagsToRemove?: string[];
+  transferToProjectId?: string; // For transferWorkflow operation - uses dedicated API call
+  /**
+   * Names of canvas groups this diff authored (via setNodeGroups). The caller passes these to the
+   * API client so an n8n rejection of a group the user just asked for surfaces as an error instead
+   * of being silently ungrouped.
+   */
+  authoredGroupNames?: string[];
 }
 
 // Helper type for node reference (supports both ID and name)
@@ -199,10 +268,10 @@ export interface NodeReference {
 }
 
 // Utility functions type guards
-export function isNodeOperation(op: WorkflowDiffOperation): op is 
-  AddNodeOperation | RemoveNodeOperation | UpdateNodeOperation | 
+export function isNodeOperation(op: WorkflowDiffOperation): op is
+  AddNodeOperation | RemoveNodeOperation | UpdateNodeOperation | PatchNodeFieldOperation |
   MoveNodeOperation | EnableNodeOperation | DisableNodeOperation {
-  return ['addNode', 'removeNode', 'updateNode', 'moveNode', 'enableNode', 'disableNode'].includes(op.type);
+  return ['addNode', 'removeNode', 'updateNode', 'patchNodeField', 'moveNode', 'enableNode', 'disableNode'].includes(op.type);
 }
 
 export function isConnectionOperation(op: WorkflowDiffOperation): op is
@@ -210,7 +279,7 @@ export function isConnectionOperation(op: WorkflowDiffOperation): op is
   return ['addConnection', 'removeConnection', 'rewireConnection', 'cleanStaleConnections', 'replaceConnections'].includes(op.type);
 }
 
-export function isMetadataOperation(op: WorkflowDiffOperation): op is 
-  UpdateSettingsOperation | UpdateNameOperation | AddTagOperation | RemoveTagOperation {
-  return ['updateSettings', 'updateName', 'addTag', 'removeTag'].includes(op.type);
+export function isMetadataOperation(op: WorkflowDiffOperation): op is
+  UpdateSettingsOperation | UpdateNameOperation | SetNodeGroupsOperation | AddTagOperation | RemoveTagOperation {
+  return ['updateSettings', 'updateName', 'setNodeGroups', 'addTag', 'removeTag'].includes(op.type);
 }

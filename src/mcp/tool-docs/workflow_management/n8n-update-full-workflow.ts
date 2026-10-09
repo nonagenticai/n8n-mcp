@@ -23,6 +23,7 @@ export const n8nUpdateFullWorkflowDoc: ToolDocumentation = {
       nodes: { type: 'array', description: 'Complete array of workflow nodes (required if modifying structure)' },
       connections: { type: 'object', description: 'Complete connections object (required if modifying structure)' },
       settings: { type: 'object', description: 'Workflow settings to update (timezone, error handling, etc.)' },
+      nodeGroups: { type: 'array', description: 'Canvas groups (n8n 2.28+): [{name, nodeIds, description?}]. Omit to keep the existing groups; pass [] to ungroup everything. Groups whose members a nodes[] update deleted are pruned automatically.' },
       intent: { type: 'string', description: 'Intent of the change - helps to return better response. Include in every tool call. Example: "Migrate workflow to new node versions".' }
     },
     returns: 'Minimal summary (id, name, active, nodeCount) for token efficiency. Use n8n_get_workflow with mode "structure" to verify current state if needed.',
@@ -52,7 +53,8 @@ export const n8nUpdateFullWorkflowDoc: ToolDocumentation = {
       'Must include ALL nodes/connections',
       'Missing nodes will be deleted',
       'Can break active workflows',
-      'No partial updates - use update_partial instead'
+      'No partial updates - use update_partial instead',
+      '**code: "PUBLISH_FORBIDDEN"** (n8n 2.39+): the API key or user may edit a published workflow but not publish it. n8n saves the change as a draft and returns 403 with the published version left unchanged (this tool does not roll back a full update). Retrying with the same credentials saves another draft without publishing - the API key needs the workflow:activate scope and the user needs workflow:publish permission on the workflow'
     ],
     relatedTools: ['n8n_get_workflow', 'n8n_update_partial_workflow', 'validate_workflow', 'n8n_create_workflow']
   }

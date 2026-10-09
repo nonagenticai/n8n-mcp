@@ -440,22 +440,24 @@ try {
     'ai_agent_workflow': {
       task: 'ai_agent_workflow',
       description: 'Create an AI agent that can use tools',
-      nodeType: 'nodes-langchain.agent',
+      nodeType: '@n8n/n8n-nodes-langchain.agent',
       configuration: {
-        text: '',
-        outputType: 'output',
-        systemMessage: 'You are a helpful assistant.'
+        promptType: 'define',
+        text: '={{ $json.query }}',
+        options: {
+          systemMessage: 'You are a helpful assistant.'
+        }
       },
       userMustProvide: [
         {
           property: 'text',
           description: 'The input prompt for the agent',
-          example: '{{ $json.query }}'
+          example: '={{ $json.query }}'
         }
       ],
       optionalEnhancements: [
         {
-          property: 'systemMessage',
+          property: 'options.systemMessage',
           description: 'Customize the agent\'s behavior'
         }
       ],
@@ -500,9 +502,20 @@ return results;`
       description: 'Filter items based on conditions',
       nodeType: 'nodes-base.if',
       configuration: {
+        // IF v2.2+ requires conditions.options, a combinator ('and'|'or'), and a
+        // stable id per condition; see node-sanitizer.ts / n8n-validation.ts /
+        // type-structures.ts for the enforced shape.
         conditions: {
+          options: {
+            version: 2,
+            leftValue: '',
+            caseSensitive: true,
+            typeValidation: 'strict'
+          },
+          combinator: 'and',
           conditions: [
             {
+              id: '1',
               leftValue: '',
               rightValue: '',
               operator: {
@@ -684,11 +697,13 @@ return results;`
     'multi_tool_ai_agent': {
       task: 'multi_tool_ai_agent',
       description: 'AI agent with multiple tools for complex automation',
-      nodeType: 'nodes-langchain.agent',
+      nodeType: '@n8n/n8n-nodes-langchain.agent',
       configuration: {
+        promptType: 'define',
         text: '={{ $json.query }}',
-        outputType: 'output',
-        systemMessage: 'You are an intelligent assistant with access to multiple tools. Use them wisely to complete tasks.'
+        options: {
+          systemMessage: 'You are an intelligent assistant with access to multiple tools. Use them wisely to complete tasks.'
+        }
       },
       userMustProvide: [
         {
@@ -1374,70 +1389,75 @@ return results;`,
       description: 'Analyze data using Python with statistics',
       nodeType: 'nodes-base.code',
       configuration: {
-        language: 'python',
-        pythonCode: `# Python data analysis - use underscore prefix for built-in variables
-import json
-from datetime import datetime
-import statistics
-
-# Collect data for analysis
+        language: 'pythonNative',
+        pythonCode: `# Native Python (pythonNative): _items is the list of input item dicts.
+# Imports are blocked unless this instance allowlists the module, so the
+# statistics below are computed with builtins only.
 values = []
 categories = {}
 dates = []
 
-# Use _input.all() to get items in Python
-for item in _input.all():
-    # Convert JsProxy to Python dict for safe access
-    item_data = item.json.to_py()
-    
-    # Extract numeric values
-    if 'value' in item_data or 'amount' in item_data:
-        value = item_data.get('value', item_data.get('amount', 0))
-        if isinstance(value, (int, float)):
-            values.append(value)
-    
-    # Count categories
-    category = item_data.get('category', 'uncategorized')
-    categories[category] = categories.get(category, 0) + 1
-    
-    # Collect dates
-    if 'date' in item_data:
-        dates.append(item_data['date'])
+for item in _items:
+    data = item["json"]
 
-# Calculate statistics
+    value = data.get("value", data.get("amount"))
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        values.append(value)
+
+    category = data.get("category", "uncategorized")
+    categories[category] = categories.get(category, 0) + 1
+
+    if data.get("date"):
+        dates.append(data["date"])
+
+ordered = sorted(values)
+count = len(ordered)
+mean = sum(ordered) / count if count else 0
+if count == 0:
+    median = 0
+elif count % 2:
+    median = ordered[count // 2]
+else:
+    median = (ordered[count // 2 - 1] + ordered[count // 2]) / 2
+
+# Sample standard deviation, the same value statistics.stdev returned
+if count > 1:
+    stdev = (sum((x - mean) ** 2 for x in ordered) / (count - 1)) ** 0.5
+else:
+    stdev = 0
+
 result = {
-    'itemCount': len(_input.all()),
-    'values': {
-        'count': len(values),
-        'sum': sum(values) if values else 0,
-        'mean': statistics.mean(values) if values else 0,
-        'median': statistics.median(values) if values else 0,
-        'min': min(values) if values else 0,
-        'max': max(values) if values else 0,
-        'stdev': statistics.stdev(values) if len(values) > 1 else 0
+    "itemCount": len(_items),
+    "values": {
+        "count": count,
+        "sum": sum(ordered),
+        "mean": mean,
+        "median": median,
+        "min": ordered[0] if ordered else 0,
+        "max": ordered[-1] if ordered else 0,
+        "stdev": stdev
     },
-    'categories': categories,
-    'dateRange': {
-        'earliest': min(dates) if dates else None,
-        'latest': max(dates) if dates else None,
-        'count': len(dates)
+    "categories": categories,
+    "dateRange": {
+        "earliest": min(dates) if dates else None,
+        "latest": max(dates) if dates else None,
+        "count": len(dates)
     },
-    'analysis': {
-        'hasNumericData': len(values) > 0,
-        'hasCategoricalData': len(categories) > 0,
-        'hasTemporalData': len(dates) > 0,
-        'dataQuality': 'good' if len(values) > len(items) * 0.8 else 'partial'
-    },
-    'processedAt': datetime.now().isoformat()
+    "analysis": {
+        "hasNumericData": count > 0,
+        "hasCategoricalData": len(categories) > 0,
+        "hasTemporalData": len(dates) > 0,
+        "dataQuality": "good" if count > len(_items) * 0.8 else "partial"
+    }
 }
 
-# Return single summary item
-return [{'json': result}]`,
+# Return a single summary item
+return [{"json": result}]`,
         onError: 'continueRegularOutput'
       },
       userMustProvide: [],
       notes: [
-        'Uses Python statistics module',
+        'Import-free: computes mean and median with builtins',
         'Analyzes numeric, categorical, and date data',
         'Returns comprehensive summary',
         'Handles missing data gracefully'

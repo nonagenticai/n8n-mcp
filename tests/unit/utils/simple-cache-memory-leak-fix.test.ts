@@ -96,11 +96,11 @@ describe('SimpleCache Memory Leak Fix', () => {
     const originalSetInterval = global.setInterval;
     
     // Mock setInterval to track created timers
-    global.setInterval = vi.fn((callback: any, delay: any) => {
+    global.setInterval = vi.fn((callback, delay) => {
       const timer = originalSetInterval(callback, delay);
       timers.push(timer);
       return timer;
-    }) as unknown as typeof global.setInterval;
+    });
     
     // Create and destroy multiple caches
     for (let i = 0; i < 5; i++) {
@@ -119,5 +119,20 @@ describe('SimpleCache Memory Leak Fix', () => {
   it('should have destroy method defined', () => {
     cache = new SimpleCache();
     expect(typeof cache.destroy).toBe('function');
+  });
+
+  it('treats the ttl argument as seconds, not milliseconds', () => {
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    cache = new SimpleCache();
+
+    // 60-second TTL: still valid at +59s, expired at +61s.
+    cache.set('k', 'v', 60);
+    expect(cache.get('k')).toBe('v');
+
+    vi.advanceTimersByTime(59_000);
+    expect(cache.get('k')).toBe('v');
+
+    vi.advanceTimersByTime(2_000); // total +61s
+    expect(cache.get('k')).toBeNull();
   });
 });

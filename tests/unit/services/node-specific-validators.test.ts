@@ -310,21 +310,19 @@ describe('NodeSpecificValidators', () => {
 
   describe('validateGoogleSheets', () => {
     describe('common validations', () => {
-      it('should require range for read operation (sheetId comes from credentials)', () => {
+      it('should not flag sheetId or range for read operation (sheetId comes from credentials, range is optional)', () => {
         context.config = {
           operation: 'read'
         };
 
         NodeSpecificValidators.validateGoogleSheets(context);
 
-        // NOTE: sheetId validation was removed because it's provided by credentials, not configuration
-        // The actual error is missing range, which is checked first
-        expect(context.errors).toContainEqual({
-          type: 'missing_required',
-          property: 'range',
-          message: 'Range is required for read operation',
-          fix: 'Specify range like "Sheet1!A:B" or "Sheet1!A1:B10"'
-        });
+        // sheetId is provided by credentials, not configuration — so it must NOT be flagged
+        const sheetIdErrors = context.errors.filter(e => e.property === 'sheetId');
+        expect(sheetIdErrors).toHaveLength(0);
+        // Range is optional for read: v4+ reads the whole sheet via the sheetName resourceLocator
+        const rangeErrors = context.errors.filter(e => e.property === 'range');
+        expect(rangeErrors).toHaveLength(0);
       });
 
       it('should accept documentId as alternative to sheetId', () => {
@@ -386,22 +384,31 @@ describe('NodeSpecificValidators', () => {
         };
       });
 
-      it('should require range for read', () => {
+      it('should not require range for read (whole-sheet read via resourceLocator is valid)', () => {
         NodeSpecificValidators.validateGoogleSheets(context);
-        
-        expect(context.errors).toContainEqual({
-          type: 'missing_required',
-          property: 'range',
-          message: 'Range is required for read operation',
-          fix: 'Specify range like "Sheet1!A:B" or "Sheet1!A1:B10"'
-        });
+
+        const rangeErrors = context.errors.filter(e => e.property === 'range');
+        expect(rangeErrors).toHaveLength(0);
+      });
+
+      it('should not require range for read when a columns object is present either', () => {
+        context.config.columns = {
+          mappingMode: 'defineBelow',
+          value: { Email: '={{ $json.email }}' },
+          matchingColumns: ['Email']
+        };
+
+        NodeSpecificValidators.validateGoogleSheets(context);
+
+        const rangeErrors = context.errors.filter(e => e.property === 'range');
+        expect(rangeErrors).toHaveLength(0);
       });
 
       it('should suggest data structure option', () => {
         context.config.range = 'Sheet1!A:B';
-        
+
         NodeSpecificValidators.validateGoogleSheets(context);
-        
+
         expect(context.suggestions).toContain('Consider setting options.dataStructure to "object" for easier data manipulation');
       });
     });
@@ -414,37 +421,55 @@ describe('NodeSpecificValidators', () => {
         };
       });
 
-      it('should require range for update', () => {
+      it('should require range or columns for update', () => {
         NodeSpecificValidators.validateGoogleSheets(context);
-        
+
         expect(context.errors).toContainEqual({
           type: 'missing_required',
           property: 'range',
-          message: 'Range is required for update operation',
-          fix: 'Specify the exact range to update like "Sheet1!A1:B10"'
+          message: 'Range or columns mapping is required for update operation',
+          fix: 'Specify range like "Sheet1!A1:B10" OR use columns with mappingMode (e.g. defineBelow)'
         });
       });
 
-      it('should require values for update', () => {
+      it('should require values or columns for update', () => {
         context.config.range = 'Sheet1!A1:B10';
-        
+
         NodeSpecificValidators.validateGoogleSheets(context);
-        
+
         expect(context.errors).toContainEqual({
           type: 'missing_required',
           property: 'values',
-          message: 'Values are required for update operation',
-          fix: 'Provide the data to write to the spreadsheet'
+          message: 'Values or columns mapping is required for update operation',
+          fix: 'Provide data via values/rawData OR use columns.value with defineBelow mapping'
         });
       });
 
       it('should accept rawData as alternative to values', () => {
         context.config.range = 'Sheet1!A1:B10';
         context.config.rawData = [[1, 2], [3, 4]];
-        
+
         NodeSpecificValidators.validateGoogleSheets(context);
-        
+
         const valuesErrors = context.errors.filter(e => e.property === 'values');
+        expect(valuesErrors).toHaveLength(0);
+      });
+
+      it('should accept columns resourceMapper as alternative to range + values (v4+ defineBelow)', () => {
+        context.config.columns = {
+          mappingMode: 'defineBelow',
+          value: {
+            Email: '={{ $json.email }}',
+            Status: 'active'
+          },
+          matchingColumns: ['Email']
+        };
+
+        NodeSpecificValidators.validateGoogleSheets(context);
+
+        const rangeErrors = context.errors.filter(e => e.property === 'range');
+        const valuesErrors = context.errors.filter(e => e.property === 'values');
+        expect(rangeErrors).toHaveLength(0);
         expect(valuesErrors).toHaveLength(0);
       });
     });
@@ -1826,20 +1851,85 @@ return [{"json": {"module": module_name}}]
         expect(mainWarnings).toHaveLength(0);
       });
 
-      it('should error on unavailable imports', () => {
+      it('should warn that a third-party import is blocked', () => {
         context.config = {
           language: 'python',
           pythonCode: 'import requests\nreturn [{"json": {"status": "ok"}}]'
         };
-        
+
         NodeSpecificValidators.validateCode(context);
-        
-        expect(context.errors).toContainEqual({
-          type: 'invalid_value',
+
+        expect(context.warnings).toContainEqual(expect.objectContaining({
           property: 'pythonCode',
-          message: 'Module \'requests\' is not available in Code nodes',
-          fix: 'Use JavaScript Code node with $helpers.httpRequest for HTTP requests'
-        });
+          message: 'import requests is blocked unless this instance allowlists the module (n8n Cloud allows none)'
+        }));
+      });
+
+      it('should warn that a standard library import is blocked', () => {
+        context.config = {
+          language: 'python',
+          pythonCode: 'import json\nreturn [{"json": {"n": len(_items)}}]'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.warnings).toContainEqual(expect.objectContaining({
+          property: 'pythonCode',
+          message: 'import json is blocked unless this instance allowlists the module (n8n Cloud allows none)'
+        }));
+      });
+
+      it('should name the module of a from-import', () => {
+        context.config = {
+          language: 'python',
+          pythonCode: 'from datetime import datetime\nreturn [{"json": {"n": len(_items)}}]'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.warnings).toContainEqual(expect.objectContaining({
+          message: 'import datetime is blocked unless this instance allowlists the module (n8n Cloud allows none)'
+        }));
+      });
+
+      it('should warn about an import after a colon on the same line', () => {
+        context.config = {
+          language: 'python',
+          pythonCode: 'if True: import json\nreturn [{"json": {"n": len(_items)}}]'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.warnings).toContainEqual(expect.objectContaining({
+          message: 'import json is blocked unless this instance allowlists the module (n8n Cloud allows none)'
+        }));
+      });
+
+      it('should name every module of a comma-separated import with aliases', () => {
+        context.config = {
+          language: 'python',
+          pythonCode: 'import json as j, datetime\nreturn [{"json": {"n": len(_items)}}]'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const blocked = context.warnings
+          .filter((w: any) => w.message.includes('is blocked unless'))
+          .map((w: any) => w.message);
+        expect(blocked).toContain('import json is blocked unless this instance allowlists the module (n8n Cloud allows none)');
+        expect(blocked).toContain('import datetime is blocked unless this instance allowlists the module (n8n Cloud allows none)');
+      });
+
+      it('should not warn about the word import inside a string', () => {
+        context.config = {
+          language: 'python',
+          pythonCode: 'note = "import json first"\nreturn [{"json": {"note": note, "n": len(_items)}}]'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const importWarnings = context.warnings.filter((w: any) => w.message.includes('is blocked unless'));
+        expect(importWarnings).toHaveLength(0);
       });
 
       it('should check indentation after colons', () => {
@@ -1863,6 +1953,894 @@ return [{"json": {"result": result}}]
       });
     });
 
+    describe('native Python runtime rules', () => {
+      const pythonConfig = (pythonCode: string, mode = 'runOnceForAllItems') => ({
+        language: 'pythonNative',
+        mode,
+        pythonCode
+      });
+
+      const errorMessages = () => context.errors.map((e: any) => e.message);
+
+      describe('removed Pyodide globals', () => {
+        it.each([
+          ['_input', '_input.all()', 'Use _items (the list of item dicts)'],
+          ['_json', '_json["name"]', 'Use _items[0]["json"]'],
+          ['_node', '_node["Webhook"]', 'No equivalent: merge the other branch upstream, or read it in JavaScript'],
+          ['_now', 'str(_now)', 'No equivalent: pass the timestamp in from an expression, or import datetime if this instance allowlists it'],
+          ['_today', 'str(_today)', 'No equivalent: pass the timestamp in from an expression, or import datetime if this instance allowlists it'],
+          ['_jmespath', '_jmespath(data, "a.b")', 'No equivalent: use $jmespath in an expression, or a list comprehension']
+        ])('should error on %s', (name, usage, fix) => {
+          context.config = pythonConfig(`data = {}\nvalue = ${usage}\nreturn [{"json": {"value": str(value)}}]`);
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(context.errors).toContainEqual({
+            type: 'invalid_value',
+            property: 'pythonCode',
+            message: `${name} does not exist in native Python - it was removed with the Pyodide runtime`,
+            fix
+          });
+        });
+
+        it('should name the each-item replacement in each-item mode', () => {
+          context.config = pythonConfig('row = _json\nreturn {"json": row}', 'runOnceForEachItem');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(context.errors).toContainEqual(expect.objectContaining({
+            message: '_json does not exist in native Python - it was removed with the Pyodide runtime',
+            fix: 'Use _item["json"]'
+          }));
+        });
+
+        it('should not fire on a similarly named variable', () => {
+          context.config = pythonConfig('my_input = _items[0]\nreturn [{"json": my_input["json"]}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('_input'))).toHaveLength(0);
+        });
+
+        it('should not fire on attribute access with a removed-global name', () => {
+          context.config = pythonConfig('return [{"json": {"a": state._json, "b": record._now}} for state, record in zip(_items, _items)]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('does not exist in native Python'))).toHaveLength(0);
+        });
+
+        it('should still fire on a reference outside the comprehension that shadows it', () => {
+          context.config = pythonConfig('return _json + [_json for _json in _items]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages()).toContain('_json does not exist in native Python - it was removed with the Pyodide runtime');
+        });
+
+        it('should not fire on a comprehension output expression bound by its own for', () => {
+          context.config = pythonConfig('return [_json for _json in _items]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('_json'))).toHaveLength(0);
+        });
+
+        it('should not fire on a parameter used in a one-line def suite', () => {
+          context.config = pythonConfig('def helper(_json): return _json\n\nreturn [{"json": helper(it["json"])} for it in _items]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('_json'))).toHaveLength(0);
+        });
+
+        it('should warn about a relative import', () => {
+          context.config = pythonConfig('from . import helper\nreturn [{"json": {"n": len(_items)}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(context.warnings.some((w: any) => w.message.includes('import helper is blocked'))).toBe(true);
+        });
+
+        it('should not fire when the name is imported into scope', () => {
+          context.config = pythonConfig('from mod import _json\nreturn [{"json": {"v": _json, "n": len(_items)}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('_json does not exist'))).toHaveLength(0);
+        });
+
+        it('should not fire when the name is an import alias', () => {
+          context.config = pythonConfig('import x as _json\nreturn [{"json": {"v": str(_json), "n": len(_items)}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('_json does not exist'))).toHaveLength(0);
+        });
+
+        it('should read a backslash-continued import as one statement', () => {
+          context.config = pythonConfig('from pkg \\\n    import _json\nreturn [{"json": {"v": _json, "n": len(_items)}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('_json does not exist'))).toHaveLength(0);
+          expect(context.warnings.some((w: any) => w.message.includes('import pkg is blocked'))).toBe(true);
+        });
+
+        it('should warn about every module of a backslash-continued import list', () => {
+          context.config = pythonConfig('import first, \\\n    second\nreturn [{"json": {"n": len(_items)}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          const blocked = context.warnings
+            .filter((w: any) => w.message.includes('is blocked unless'))
+            .map((w: any) => w.message);
+          expect(blocked).toContain('import first is blocked unless this instance allowlists the module (n8n Cloud allows none)');
+          expect(blocked).toContain('import second is blocked unless this instance allowlists the module (n8n Cloud allows none)');
+        });
+
+        it('should warn about every module of a parenthesised import list', () => {
+          context.config = pythonConfig('from pkg import (\n    alpha,\n    beta,\n)\nreturn [{"json": {"n": len(_items)}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(context.warnings.some((w: any) => w.message.includes('import pkg is blocked'))).toBe(true);
+        });
+
+        it('should not fire when the code assigns the name itself', () => {
+          context.config = pythonConfig('_json = {"count": len(_items)}\nreturn _json');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('_json'))).toHaveLength(0);
+        });
+
+        it('should not fire when the name is a function parameter', () => {
+          context.config = pythonConfig('def transform(_item):\n    return {"json": _item["json"]}\n\nreturn [transform(it) for it in _items]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('_item does not exist'))).toHaveLength(0);
+        });
+
+        it('should not fire when the name is a lambda parameter', () => {
+          context.config = pythonConfig('shape = lambda _item: {"json": _item["json"]}\nreturn [shape(it) for it in _items]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('_item does not exist'))).toHaveLength(0);
+        });
+
+        it('should still fire on a top-level reference when only a helper binds the name', () => {
+          context.config = pythonConfig([
+            'def helper(_json):',
+            '    return _json',
+            '',
+            'return {"v": _json, "n": len(_items)}'
+          ].join('\n'));
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages()).toContain('_json does not exist in native Python - it was removed with the Pyodide runtime');
+        });
+
+        it('should fire on a name used as a parameter default', () => {
+          context.config = pythonConfig('def helper(x=_json):\n    return x\n\nreturn [{"json": {"v": helper()}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages()).toContain('_json does not exist in native Python - it was removed with the Pyodide runtime');
+        });
+
+        it('should fire on a name used as a lambda parameter default', () => {
+          context.config = pythonConfig('shape = lambda x=_json: x\nreturn [{"json": {"v": shape()}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages()).toContain('_json does not exist in native Python - it was removed with the Pyodide runtime');
+        });
+
+        it('should treat destructuring and annotated assignment as bindings', () => {
+          context.config = pythonConfig('_json, other = {"a": 1}, 2\n_now: dict = {}\nreturn [{"json": {"a": _json, "b": other, "c": _now}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('_json') || m.includes('_now'))).toHaveLength(0);
+        });
+
+        it('should not see a string literal nested in an f-string field', () => {
+          context.config = pythonConfig(`label = f"{'_json'}"\nreturn [{"json": {"label": label, "n": len(_items)}}]`);
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('_json'))).toHaveLength(0);
+        });
+
+        it('should see a legacy global inside an f-string replacement field', () => {
+          context.config = pythonConfig('msg = f"{_input.all()}"\nreturn [{"json": {"msg": msg}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages()).toContain('_input does not exist in native Python - it was removed with the Pyodide runtime');
+        });
+
+        it('should not fire on a legacy global inside a string', () => {
+          context.config = pythonConfig('note = "replace _input.all() with _items"\nreturn [{"json": {"note": note, "n": len(_items)}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('_input'))).toHaveLength(0);
+        });
+      });
+
+      describe('mode-bound input variables', () => {
+        it('should error on _items in each-item mode', () => {
+          context.config = pythonConfig('return {"json": {"n": len(_items)}}', 'runOnceForEachItem');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(context.errors).toContainEqual(expect.objectContaining({
+            message: '_items does not exist in "Run Once for Each Item" mode',
+            fix: 'Use _item, or switch mode to runOnceForAllItems'
+          }));
+        });
+
+        it('should error on _item in all-items mode', () => {
+          context.config = pythonConfig('return [{"json": _item["json"]}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(context.errors).toContainEqual(expect.objectContaining({
+            message: '_item does not exist in "Run Once for All Items" mode'
+          }));
+        });
+
+        it('should not fire on attribute access named like a mode variable', () => {
+          context.config = pythonConfig('return {"json": {"n": len(record._items)}}', 'runOnceForEachItem');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('_items does not exist'))).toHaveLength(0);
+        });
+
+        it('should still fire when _items is only a comprehension iterable', () => {
+          context.config = pythonConfig('return {"json": {"n": sum(1 for it in _items)}}', 'runOnceForEachItem');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages()).toContain('_items does not exist in "Run Once for Each Item" mode');
+        });
+
+        it('should not fire when _item is a loop target', () => {
+          context.config = pythonConfig('out = []\nfor _item in _items:\n    out.append({"json": _item["json"]})\nreturn out');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('_item does not exist'))).toHaveLength(0);
+        });
+
+        it('should not fire when _item is assigned', () => {
+          context.config = pythonConfig('_item = _items[0]\nreturn [{"json": _item["json"]}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('_item does not exist'))).toHaveLength(0);
+        });
+
+        it('should still fire when _item is only read', () => {
+          context.config = pythonConfig('return [{"json": _item["json"]}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages()).toContain('_item does not exist in "Run Once for All Items" mode');
+        });
+
+        it('should skip the mode check when mode is an expression', () => {
+          context.config = pythonConfig('return [{"json": _item["json"]}]', '={{ $json.codeMode }}');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('does not exist in "Run Once'))).toHaveLength(0);
+        });
+
+        it('should not read _items as _item in all-items mode', () => {
+          context.config = pythonConfig('return [{"json": it["json"]} for it in _items]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('_item does not exist'))).toHaveLength(0);
+        });
+
+        it('should accept _item in each-item mode', () => {
+          context.config = pythonConfig('return {"json": _item["json"]}', 'runOnceForEachItem');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(context.errors).toHaveLength(0);
+        });
+      });
+
+      describe('dict access', () => {
+        it('should error on .json attribute access', () => {
+          context.config = pythonConfig('total = sum(it.json["amount"] for it in _items)\nreturn [{"json": {"total": total}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(context.errors).toContainEqual(expect.objectContaining({
+            message: 'Items are dicts: .json attribute access raises AttributeError',
+            fix: 'Use dict access: item["json"]["field"] or item["json"].get("field")'
+          }));
+        });
+
+        it('should error on _items[0].json', () => {
+          context.config = pythonConfig('first = _items[0].json\nreturn [{"json": first}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages()).toContain('Items are dicts: .json attribute access raises AttributeError');
+        });
+
+        it('should not flag a .json() call', () => {
+          context.config = pythonConfig('body = response.json()\nreturn [{"json": {"body": body, "n": len(_items)}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('.json attribute access'))).toHaveLength(0);
+        });
+
+        it('should not flag a .json filename in a string', () => {
+          context.config = pythonConfig('name = "report.json"\nreturn [{"json": {"name": name, "n": len(_items)}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('.json attribute access'))).toHaveLength(0);
+        });
+      });
+
+      describe('class definitions', () => {
+        it('should error on a class definition', () => {
+          context.config = pythonConfig('class Box:\n    pass\n\nreturn [{"json": {"n": len(_items)}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(context.errors).toContainEqual(expect.objectContaining({
+            message: 'class definitions fail in the sandbox: __build_class__ not found',
+            fix: 'Use dicts and plain functions instead of a class'
+          }));
+        });
+
+        it('should not flag the word class in a string', () => {
+          context.config = pythonConfig('label = "class Box"\nreturn [{"json": {"label": label, "n": len(_items)}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('__build_class__'))).toHaveLength(0);
+        });
+      });
+
+      describe('denied builtins', () => {
+        it.each(['type', 'getattr', 'hasattr', 'setattr', 'vars', 'dir', 'globals', 'locals', 'open', 'input', 'compile', 'eval', 'exec'])(
+          'should error on %s()',
+          (builtin) => {
+            context.config = pythonConfig(`x = ${builtin}(_items)\nreturn [{"json": {"x": str(x)}}]`);
+
+            NodeSpecificValidators.validateCode(context);
+
+            expect(errorMessages()).toContain(`${builtin}() is denied in the Python sandbox and raises NameError`);
+          }
+        );
+
+        it('should error on a bare reference, not only a call', () => {
+          context.config = pythonConfig('fn = eval\nreturn [{"json": {"n": len(_items)}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages()).toContain('eval() is denied in the Python sandbox and raises NameError');
+        });
+
+        it('should not flag attribute access with a denied name', () => {
+          context.config = pythonConfig('return [{"json": {"t": obj.type}} for obj in _items]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('type() is denied'))).toHaveLength(0);
+        });
+
+        it('should not flag a keyword-argument name', () => {
+          context.config = pythonConfig('def render(type=None):\n    return type\n\nreturn [{"json": {"v": render(type=1)}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('type() is denied'))).toHaveLength(0);
+        });
+
+        it('should not flag a name imported into scope', () => {
+          context.config = pythonConfig('from builtins import type\nreturn [{"json": {"t": str(type(1))}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('type() is denied'))).toHaveLength(0);
+          expect(context.warnings.some((w: any) => w.message.includes('import builtins is blocked'))).toBe(true);
+        });
+
+        it('should not flag a call to a locally defined function of the same name', () => {
+          context.config = pythonConfig('def type(value):\n    return "n" if isinstance(value, int) else "s"\n\nreturn [{"json": {"t": type(it["json"].get("v"))}} for it in _items]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('type() is denied'))).toHaveLength(0);
+        });
+
+        it('should still flag a top-level call when only a helper rebinds the name', () => {
+          context.config = pythonConfig([
+            'def helper():',
+            '    type = str',
+            '    return type(1)',
+            '',
+            'return [{"json": {"a": helper(), "b": type(1)}}]'
+          ].join('\n'));
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages()).toContain('type() is denied in the Python sandbox and raises NameError');
+        });
+
+        it('should flag a denied builtin used as a parameter default', () => {
+          context.config = pythonConfig('def helper(x=type(1)):\n    return x\n\nreturn [{"json": {"v": helper()}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages()).toContain('type() is denied in the Python sandbox and raises NameError');
+        });
+
+        it('should not see a denied builtin nested in an f-string string literal', () => {
+          context.config = pythonConfig(`label = f"{'type(1)'}"\nreturn [{"json": {"label": label, "n": len(_items)}}]`);
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('type() is denied'))).toHaveLength(0);
+        });
+
+        it('should not flag an attribute call with the same name', () => {
+          context.config = pythonConfig('x = shape.type(_items)\nreturn [{"json": {"x": str(x)}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('type() is denied'))).toHaveLength(0);
+        });
+
+        it('should not flag an identifier that merely ends with a denied name', () => {
+          context.config = pythonConfig('x = user_input(_items)\nreturn [{"json": {"x": str(x)}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('input() is denied'))).toHaveLength(0);
+        });
+
+        it('should not flag a denied builtin inside a string', () => {
+          context.config = pythonConfig('note = "do not call eval(x)"\nreturn [{"json": {"note": note, "n": len(_items)}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('denied in the Python sandbox'))).toHaveLength(0);
+        });
+
+        it('should not duplicate the eval warning from the security pass', () => {
+          context.config = pythonConfig('x = eval("1+1")\nreturn [{"json": {"x": x, "n": len(_items)}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(context.warnings.filter((w: any) => w.message.includes('Avoid eval()'))).toHaveLength(0);
+        });
+      });
+
+      describe('dunder access', () => {
+        it.each([
+          ['attribute access', 'name = _items[0].__class__'],
+          ['bare __class__', 'name = __class__'],
+          ['__builtins__', 'name = __builtins__'],
+          ['__import__', 'mod = __import__("json")']
+        ])('should error on %s', (_label, snippet) => {
+          context.config = pythonConfig(`${snippet}\nreturn [{"json": {"name": str(name if "name" in dir() else mod)}}]`);
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages()).toContain('Dunder access is rejected before the code runs: Security violations detected');
+        });
+
+        it('should error on a dunder reached through a format string', () => {
+          context.config = pythonConfig('leak = "{0.__class__}".format(_items)\nreturn [{"json": {"leak": leak}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages()).toContain('Dunder access is rejected before the code runs: Security violations detected');
+        });
+
+        it('should not error on a dunder in a string that is never formatted', () => {
+          context.config = pythonConfig('label = "{obj.__class__}"\nreturn [{"json": {"label": label, "n": len(_items)}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.startsWith('Dunder access'))).toHaveLength(0);
+        });
+
+        it('should not error on a dunder mentioned in a comment', () => {
+          context.config = pythonConfig('# never use {0.__class__} here\nreturn [{"json": {"n": len(_items)}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.startsWith('Dunder access'))).toHaveLength(0);
+        });
+
+        it('should report dunder access once', () => {
+          context.config = pythonConfig('a = _items[0].__class__\nb = __builtins__\nreturn [{"json": {"a": str(a), "b": str(b)}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.startsWith('Dunder access'))).toHaveLength(1);
+        });
+
+        it('should keep the __main__ warning and not raise a dunder error for it', () => {
+          context.config = pythonConfig('if __name__ == "__main__":\n    pass\n\nreturn [{"json": {"n": len(_items)}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(context.warnings).toContainEqual(expect.objectContaining({
+            message: 'if __name__ == "__main__" is not needed in Code nodes'
+          }));
+          expect(errorMessages().filter(m => m.startsWith('Dunder access'))).toHaveLength(0);
+        });
+      });
+
+      describe('global statement', () => {
+        it('should error on global', () => {
+          context.config = pythonConfig('total = 0\n\ndef add(n):\n    global total\n    total += n\n\nfor it in _items:\n    add(it["json"].get("amount", 0))\n\nreturn [{"json": {"total": total}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(context.errors).toContainEqual(expect.objectContaining({
+            message: 'global does not work: your code runs inside a wrapper function',
+            fix: 'Use nonlocal instead of global'
+          }));
+        });
+
+        it('should not flag nonlocal', () => {
+          context.config = pythonConfig('total = 0\n\ndef add(n):\n    nonlocal total\n    total += n\n\nfor it in _items:\n    add(it["json"].get("amount", 0))\n\nreturn [{"json": {"total": total}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('global does not work'))).toHaveLength(0);
+        });
+
+        it('should not flag the word global in a string', () => {
+          context.config = pythonConfig('scope = "global"\nreturn [{"json": {"scope": scope, "n": len(_items)}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('global does not work'))).toHaveLength(0);
+        });
+
+        it('should not flag a top-level global, which is a harmless no-op', () => {
+          context.config = pythonConfig('global cache\ncache = {"seen": len(_items)}\nreturn [{"json": cache}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('global does not work'))).toHaveLength(0);
+        });
+
+        it('should flag a global in a function whose header ends on its own line', () => {
+          context.config = pythonConfig([
+            'counter = 0',
+            '',
+            'def helper(',
+            '):',
+            '    global counter',
+            '    return 1',
+            '',
+            'return [{"json": {"n": helper() + len(_items)}}]'
+          ].join('\n'));
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages()).toContain('global does not work: your code runs inside a wrapper function');
+        });
+
+        it('should flag a global nested two levels deep in a function', () => {
+          context.config = pythonConfig([
+            'total = 0',
+            '',
+            'def outer():',
+            '    def inner():',
+            '        global total',
+            '        return 1',
+            '    return inner()',
+            '',
+            'return [{"json": {"total": total + outer(), "n": len(_items)}}]'
+          ].join('\n'));
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages()).toContain('global does not work: your code runs inside a wrapper function');
+        });
+      });
+
+      describe('return-shape scanning', () => {
+        it('should not error on a primitive return that only appears in a comment', () => {
+          context.config = pythonConfig('# TODO: return None when the list is empty\nreturn [{"json": {"n": len(_items)}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('Cannot return primitive values'))).toHaveLength(0);
+        });
+
+        it('should error on an f-string return', () => {
+          context.config = pythonConfig('return f"processed {len(_items)} items"');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages()).toContain('Cannot return primitive values directly');
+        });
+
+        it.each(['-1', '+1', '.5'])('should error on a signed or leading-dot primitive return (%s)', (literal) => {
+          context.config = pythonConfig(`return ${literal}`);
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages()).toContain('Cannot return primitive values directly');
+        });
+
+        it('should not error on a negated identifier return', () => {
+          context.config = pythonConfig('total = len(_items)\nreturn [{"json": {"t": -total}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('Cannot return primitive values'))).toHaveLength(0);
+        });
+
+        it('should flag a parenthesised list return in each-item mode', () => {
+          context.config = pythonConfig('return ([{"json": _item["json"]}])', 'runOnceForEachItem');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages()).toContain('Returning a list in "Run Once for Each Item" mode fails: a \'json\' property isn\'t a dictionary');
+        });
+
+        it('should not flag a parenthesised dict return in each-item mode', () => {
+          context.config = pythonConfig('return ({"json": _item["json"]})', 'runOnceForEachItem');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('Run Once for Each Item" mode fails'))).toHaveLength(0);
+        });
+
+        it('should still error on a plain string return', () => {
+          context.config = pythonConfig('return "success"');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages()).toContain('Cannot return primitive values directly');
+        });
+
+        it('should not read a multi-line def header as ending the function body', () => {
+          context.config = pythonConfig([
+            'def helper(',
+            '    value',
+            '):',
+            '    return None',
+            '',
+            'helper(1)',
+            'return {"ok": True, "n": len(_items)}'
+          ].join('\n'));
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('Cannot return primitive values'))).toHaveLength(0);
+        });
+
+        it('should not flag indexing into a returned list in each-item mode', () => {
+          context.config = pythonConfig('return [{"json": _item["json"]}][0]', 'runOnceForEachItem');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('Run Once for Each Item" mode fails'))).toHaveLength(0);
+        });
+
+        it('should flag a multi-line list return in each-item mode', () => {
+          context.config = pythonConfig('return [\n    {"json": _item["json"]}\n]', 'runOnceForEachItem');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages()).toContain('Returning a list in "Run Once for Each Item" mode fails: a \'json\' property isn\'t a dictionary');
+        });
+
+        it('should not swallow the lines after a single-line def', () => {
+          context.config = pythonConfig('def helper(): return 1\nvalue = helper()\nreturn "value is " + str(value)');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages()).toContain('Cannot return primitive values directly');
+        });
+
+        it('should not flag an indexed _items return in each-item mode', () => {
+          context.config = pythonConfig('return _items[0]', 'runOnceForEachItem');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('Run Once for Each Item" mode fails'))).toHaveLength(0);
+        });
+
+        it('should flag a list return that ends with a semicolon in each-item mode', () => {
+          context.config = pythonConfig('return [_item];', 'runOnceForEachItem');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages()).toContain('Returning a list in "Run Once for Each Item" mode fails: a \'json\' property isn\'t a dictionary');
+        });
+
+        it('should not error on an identifier that starts with a literal keyword', () => {
+          context.config = pythonConfig('None_of_them = [{"json": {"n": len(_items)}}]\nreturn None_of_them');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('Cannot return primitive values'))).toHaveLength(0);
+        });
+      });
+
+      describe('input reference warning', () => {
+        it('should name _items in all-items mode', () => {
+          context.config = pythonConfig('value = 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10\nreturn [{"json": {"value": value}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(context.warnings).toContainEqual(expect.objectContaining({
+            message: 'Code doesn\'t reference input data',
+            suggestion: 'Access input with: _items (the list of item dicts)'
+          }));
+        });
+
+        it('should name _item in each-item mode', () => {
+          context.config = pythonConfig('value = 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10\nreturn {"json": {"value": value}}', 'runOnceForEachItem');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(context.warnings).toContainEqual(expect.objectContaining({
+            suggestion: 'Access input with: _item (the current item dict)'
+          }));
+        });
+
+        it('should not warn when legacy globals are used (the error covers it)', () => {
+          context.config = pythonConfig('rows = _input.all()\nreturn [{"json": {"count": len(rows), "padding": "xxxxxxxxxxxxxxxxxxxx"}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(context.warnings.filter((w: any) => w.message === 'Code doesn\'t reference input data')).toHaveLength(0);
+        });
+      });
+
+      describe('JavaScript-only advice stays out of Python', () => {
+        it('should not warn about $now() style helpers for Python', () => {
+          context.config = pythonConfig('keys = list(_items[0]["json"].keys())\nreturn [{"json": {"keys": keys}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(context.warnings.filter((w: any) => w.message.includes('expression-only function'))).toHaveLength(0);
+        });
+
+        it('should not run the JMESPath numeric check for Python', () => {
+          context.config = pythonConfig('q = _jmespath(_items, "[?age >= 18]")\nreturn [{"json": {"q": str(q)}}]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.includes('JMESPath numeric literal'))).toHaveLength(0);
+          expect(errorMessages()).toContain('_jmespath does not exist in native Python - it was removed with the Pyodide runtime');
+        });
+      });
+
+      describe('the JavaScript items variable', () => {
+        it('should error on a bare items reference', () => {
+          context.config = pythonConfig('return [{"json": it["json"]} for it in items]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(context.errors).toContainEqual(expect.objectContaining({
+            message: 'items does not exist in native Python; use _items (all-items mode) or _item (each-item mode)',
+            fix: 'Use _items (the list of item dicts)'
+          }));
+        });
+
+        it('should name _item in each-item mode', () => {
+          context.config = pythonConfig('return {"json": items[0]["json"]}', 'runOnceForEachItem');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(context.errors).toContainEqual(expect.objectContaining({
+            fix: 'Use _item (the current item dict)'
+          }));
+        });
+
+        it('should error on a bare items call', () => {
+          context.config = pythonConfig('return items(_items)');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages()).toContain('items does not exist in native Python; use _items (all-items mode) or _item (each-item mode)');
+        });
+
+        it('should not fire on a dict .items() call', () => {
+          context.config = pythonConfig('return [{"json": dict(it["json"].items())} for it in _items]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.startsWith('items does not exist'))).toHaveLength(0);
+        });
+
+        it('should not fire on a for loop over .items()', () => {
+          context.config = pythonConfig('out = []\nfor it in _items:\n    for k, v in it["json"].items():\n        out.append({"json": {"k": k, "v": v}})\nreturn out');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.startsWith('items does not exist'))).toHaveLength(0);
+        });
+
+        it('should not fire when the code binds items itself', () => {
+          context.config = pythonConfig('items = _items\nreturn [{"json": it["json"]} for it in items]');
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages().filter(m => m.startsWith('items does not exist'))).toHaveLength(0);
+        });
+      });
+
+      describe('upper-case f-string prefixes', () => {
+        it.each(['F', 'Rf', 'fR'])('should see a replacement field in a %s-string', (prefix) => {
+          context.config = pythonConfig(`msg = ${prefix}"{_input.all()}"\nreturn [{"json": {"msg": msg}}]`);
+
+          NodeSpecificValidators.validateCode(context);
+
+          expect(errorMessages()).toContain('_input does not exist in native Python - it was removed with the Pyodide runtime');
+        });
+      });
+
+      describe('adversarial input stays fast', () => {
+        const budgetMs = 500;
+
+        it.each([
+          ['unclosed def headers', 'def f(\n'],
+          ['unclosed list returns', 'return [\n'],
+          ['bare returns', 'return _items\n'],
+          ['tab-padded bare returns', 'return\t_items\t\t\t\t\t\t\t\t\n'],
+          ['tab-padded imports', 'import\tjson\t\t\t\t\t\t\t\t\n'],
+          ['tab runs', '\t'.repeat(64) + '\n']
+        ])('should validate 200 KB of %s under the budget', (_label, unit) => {
+          const pythonCode = unit.repeat(Math.ceil(200_000 / unit.length));
+          context.config = pythonConfig(pythonCode);
+
+          const started = Date.now();
+          NodeSpecificValidators.validateCode(context);
+          const elapsed = Date.now() - started;
+
+          expect(elapsed).toBeLessThan(budgetMs);
+        });
+      });
+
+      it('should report nothing for idiomatic native Python', () => {
+        context.config = pythonConfig([
+          'results = []',
+          'for it in _items:',
+          '    row = it["json"]',
+          '    if not row.get("active"):',
+          '        continue',
+          '    results.append({"json": {"name": row.get("name", "").title()}})',
+          '',
+          'return results'
+        ].join('\n'));
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.errors).toHaveLength(0);
+      });
+    });
+
     describe('return statement validation', () => {
       it('should error on missing return statement', () => {
         context.config = {
@@ -1880,20 +2858,16 @@ return [{"json": {"result": result}}]
         });
       });
 
-      it('should error on object return without array', () => {
+      it('should not error on object return without array (n8n auto-wraps a bare object)', () => {
         context.config = {
           language: 'javaScript',
           jsCode: 'return {status: "ok"};'
         };
-        
+
         NodeSpecificValidators.validateCode(context);
-        
-        expect(context.errors).toContainEqual({
-          type: 'invalid_value',
-          property: 'jsCode',
-          message: 'Return value must be an array of objects',
-          fix: 'Wrap in array: return [{json: yourObject}]'
-        });
+
+        const returnErrors = context.errors.filter(e => e.message === 'Return value must be an array of objects');
+        expect(returnErrors).toHaveLength(0);
       });
 
       it('should error on primitive return', () => {
@@ -1912,20 +2886,430 @@ return [{"json": {"result": result}}]
         });
       });
 
+      it('should not error on primitive return inside helper functions', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'function isValid(item) { return false; }\nconst items = $input.all();\nreturn items.filter(isValid).map(i => ({json: i.json}));'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const primitiveErrors = context.errors.filter(e => e.message === 'Cannot return primitive values directly');
+        expect(primitiveErrors).toHaveLength(0);
+      });
+
+      it('should not error on primitive return inside arrow function helpers', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const isValid = (item) => { return false; };\nreturn $input.all().filter(isValid).map(i => ({json: i.json}));'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const primitiveErrors = context.errors.filter(e => e.message === 'Cannot return primitive values directly');
+        expect(primitiveErrors).toHaveLength(0);
+      });
+
+      it('should not error on primitive return inside async function helpers', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'async function fetchData(url) { return null; }\nconst data = await fetchData("https://api.example.com");\nreturn [{json: {data}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const primitiveErrors = context.errors.filter(e => e.message === 'Cannot return primitive values directly');
+        expect(primitiveErrors).toHaveLength(0);
+      });
+
+      it('should not error on primitive-looking returns in comments or strings', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: [
+            'const quoted = "not code: return \\"bad\\"";',
+            'const templated = `not code: return false`;',
+            '// return "bad";',
+            '/* return null; */',
+            'return [{json: {quoted, templated}}];',
+          ].join('\n')
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const primitiveErrors = context.errors.filter(e => e.message === 'Cannot return primitive values directly');
+        expect(primitiveErrors).toHaveLength(0);
+      });
+
+      it('should not error on primitive helper returns inside nested blocks', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: [
+            'const normalize = (value) => {',
+            '  /* helper can return primitives */',
+            '  if (!value) { return ""; }',
+            '  return value;',
+            '};',
+            'return [{json: {value: normalize("ok")}}];',
+          ].join('\n')
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const primitiveErrors = context.errors.filter(e => e.message === 'Cannot return primitive values directly');
+        expect(primitiveErrors).toHaveLength(0);
+      });
+
+      it('should not error on primitive return inside object-method shorthand', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const o = { foo() { return 1; } };\nreturn [{json: o}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const primitiveErrors = context.errors.filter(e => e.message === 'Cannot return primitive values directly');
+        expect(primitiveErrors).toHaveLength(0);
+      });
+
+      it('should not error on primitive return inside class methods', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'class A { m() { return false; } }\nreturn [{json: {}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const primitiveErrors = context.errors.filter(e => e.message === 'Cannot return primitive values directly');
+        expect(primitiveErrors).toHaveLength(0);
+      });
+
+      it('should not error on primitive return inside generator functions', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'function* gen() { return 1; }\nreturn [{json: {}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const primitiveErrors = context.errors.filter(e => e.message === 'Cannot return primitive values directly');
+        expect(primitiveErrors).toHaveLength(0);
+      });
+
+      it('should not error when a helper uses a regex literal containing braces', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: "const clean = (s) => { s = s.replace(/[/{}]/g, ''); return false; };\nreturn [{json: {ok: clean('x')}}];"
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const primitiveErrors = context.errors.filter(e => e.message === 'Cannot return primitive values directly');
+        expect(primitiveErrors).toHaveLength(0);
+      });
+
+      it('should not error on a helper whose params contain nested parentheses', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'function normalize(item = $input.first()) { return null; }\nreturn [{json: {v: normalize()}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const primitiveErrors = context.errors.filter(e => e.message === 'Cannot return primitive values directly');
+        expect(primitiveErrors).toHaveLength(0);
+      });
+
+      it('should not error on an arrow helper with a function-call default param', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const pick = (x = Math.max(1, 2)) => { return false; };\nreturn [{json: {v: pick()}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const primitiveErrors = context.errors.filter(e => e.message === 'Cannot return primitive values directly');
+        expect(primitiveErrors).toHaveLength(0);
+      });
+
+      it('should flag a primitive return inside a for-await block (not treat it as a function body)', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'for await (const item of source) { return "bad"; }'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.errors).toContainEqual(
+          expect.objectContaining({ message: 'Cannot return primitive values directly' })
+        );
+      });
+
+      it('should not flag a valid for-await loop with a top-level array return', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const results = [];\nfor await (const x of items) { results.push(x); }\nreturn [{json: {results}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const primitiveErrors = context.errors.filter(e => e.message === 'Cannot return primitive values directly');
+        expect(primitiveErrors).toHaveLength(0);
+      });
+
+      it('should report missing return when the only return is in a comment or string', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: '// return "bad"\nconst x = 1;'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.errors).toContainEqual(
+          expect.objectContaining({ message: 'Code must return data for the next node' })
+        );
+      });
+
+      it('should still error on a real primitive return when a regex literal is present', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: "const m = 'a'.match(/b/);\nreturn 7;"
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.errors).toContainEqual(
+          expect.objectContaining({ message: 'Cannot return primitive values directly' })
+        );
+      });
+
+      it('should not flag an identifier that merely starts with a primitive keyword', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'function f(x){ return x; }\nconst trueItems = [{json: {}}];\nreturn trueItems;'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const primitiveErrors = context.errors.filter(e => e.message === 'Cannot return primitive values directly');
+        expect(primitiveErrors).toHaveLength(0);
+      });
+
+      it('should treat division after a string literal as division, not a regex', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const ratio = "10" / 2;\nreturn [{json: {ratio}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const missing = context.errors.filter(e => e.message === 'Code must return data for the next node');
+        expect(missing).toHaveLength(0);
+      });
+
+      it('should recognize a helper body when a block comment sits before its brace', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'function normalize() /* note */ { return null; }\nreturn [{json: {v: normalize()}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const primitiveErrors = context.errors.filter(e => e.message === 'Cannot return primitive values directly');
+        expect(primitiveErrors).toHaveLength(0);
+      });
+
+      it('should still error on primitive top-level return when helper functions exist', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const isValid = (item) => { return false; };\nconst items = $input.all();\nif (!items.length) return "empty";\nreturn items.filter(isValid).map(i => ({json: i.json}));'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.errors).toContainEqual(expect.objectContaining({
+          message: 'Cannot return primitive values directly'
+        }));
+      });
+
+      it('should still error on primitive try-block return when helper functions exist', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'function normalize(item) { return null; }\ntry {\n  const items = $input.all();\n  return "bad";\n} catch (error) {\n  return [{json: {error: error.message}}];\n}'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.errors).toContainEqual(expect.objectContaining({
+          message: 'Cannot return primitive values directly'
+        }));
+      });
+
+      it('should still error on primitive return without helper functions', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'return "success";'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.errors).toContainEqual(expect.objectContaining({
+          message: 'Cannot return primitive values directly'
+        }));
+      });
+
+      it('should still check primitive returns in very large code blocks', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: `${'const padding = 1;\n'.repeat(12000)}return "too large";`
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.errors).toContainEqual(expect.objectContaining({
+          message: 'Cannot return primitive values directly'
+        }));
+      });
+
+      it('should not error on bare object return in runOnceForEachItem mode', () => {
+        context.config = {
+          language: 'javaScript',
+          mode: 'runOnceForEachItem',
+          jsCode: 'return {status: "ok", data: 123};'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const returnErrors = context.errors.filter(
+          (e: any) => e.message === 'Return value must be an array of objects'
+        );
+        expect(returnErrors).toHaveLength(0);
+      });
+
+      it('should not error on primitive return in runOnceForEachItem mode', () => {
+        context.config = {
+          language: 'javaScript',
+          mode: 'runOnceForEachItem',
+          jsCode: 'return "success";'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const primitiveErrors = context.errors.filter(
+          (e: any) => e.message === 'Cannot return primitive values directly'
+        );
+        expect(primitiveErrors).toHaveLength(0);
+      });
+
+      it('should not error on bare object return in runOnceForAllItems mode (n8n auto-wraps)', () => {
+        context.config = {
+          language: 'javaScript',
+          mode: 'runOnceForAllItems',
+          jsCode: 'return {status: "ok"};'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const returnErrors = context.errors.filter(e => e.message === 'Return value must be an array of objects');
+        expect(returnErrors).toHaveLength(0);
+      });
+
       it('should error on Python primitive return', () => {
         context.config = {
           language: 'python',
           pythonCode: 'return "success"'
         };
-        
+
         NodeSpecificValidators.validateCode(context);
-        
+
         expect(context.errors).toContainEqual({
           type: 'invalid_value',
           property: 'pythonCode',
           message: 'Cannot return primitive values directly',
           fix: 'Return list of dicts: return [{"json": {"value": your_data}}]'
         });
+      });
+
+      it('should accept a bare dict return in runOnceForAllItems mode', () => {
+        context.config = {
+          language: 'python',
+          mode: 'runOnceForAllItems',
+          pythonCode: 'return {"count": len(_items)}'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.errors).toHaveLength(0);
+      });
+
+      it('should accept a list of plain dicts in runOnceForAllItems mode', () => {
+        context.config = {
+          language: 'python',
+          mode: 'runOnceForAllItems',
+          pythonCode: 'return [{"name": it["json"]["name"]} for it in _items]'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.errors).toHaveLength(0);
+      });
+
+      it('should not error on Python bare dict return in runOnceForEachItem mode', () => {
+        context.config = {
+          language: 'python',
+          mode: 'runOnceForEachItem',
+          pythonCode: 'return {"status": _item["json"]["status"]}'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.errors).toHaveLength(0);
+      });
+
+      it('should error on a list return in runOnceForEachItem mode', () => {
+        context.config = {
+          language: 'python',
+          mode: 'runOnceForEachItem',
+          pythonCode: 'return [{"json": _item["json"]}]'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.errors).toContainEqual(expect.objectContaining({
+          property: 'pythonCode',
+          message: 'Returning a list in "Run Once for Each Item" mode fails: a \'json\' property isn\'t a dictionary'
+        }));
+      });
+
+      it('should error on returning list() in runOnceForEachItem mode', () => {
+        context.config = {
+          language: 'python',
+          mode: 'runOnceForEachItem',
+          pythonCode: 'rows = _item["json"]["rows"]\nreturn list(rows)'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.errors).toContainEqual(expect.objectContaining({
+          message: 'Returning a list in "Run Once for Each Item" mode fails: a \'json\' property isn\'t a dictionary'
+        }));
+      });
+
+      it('should not read a helper function\'s list return as the node return', () => {
+        context.config = {
+          language: 'python',
+          mode: 'runOnceForEachItem',
+          pythonCode: [
+            'def rows(d):',
+            '    return [d]',
+            '',
+            'return {"json": {"rows": rows(_item["json"])}}'
+          ].join('\n')
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const listErrors = context.errors.filter((e: any) => e.message.includes('Run Once for Each Item'));
+        expect(listErrors).toHaveLength(0);
       });
 
       it('should error on array of non-objects', () => {
@@ -1969,7 +3353,7 @@ return [{"json": {"result": result}}]
         NodeSpecificValidators.validateCode(context);
         
         expect(context.warnings).toContainEqual({
-          type: 'missing_common',
+          type: 'best_practice',
           message: 'Code doesn\'t reference input data',
           suggestion: 'Access input with: items, $input.all(), or $json (single-item mode)'
         });
@@ -2036,6 +3420,30 @@ return [{"json": {"result": result}}]
           message: 'Invalid $ usage detected',
           suggestion: 'n8n variables start with $: $json, $input, $node, $workflow, $execution'
         });
+      });
+
+      it('should not warn about $() node reference syntax', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const data = $("Previous Node").first().json;\nreturn [{json: data}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const dollarWarnings = context.warnings.filter(w => w.message === 'Invalid $ usage detected');
+        expect(dollarWarnings).toHaveLength(0);
+      });
+
+      it('should not warn about $_ variables', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const $_temp = 1;\nreturn [{json: {value: $_temp}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const dollarWarnings = context.warnings.filter(w => w.message === 'Invalid $ usage detected');
+        expect(dollarWarnings).toHaveLength(0);
       });
 
       it('should correct helpers usage', () => {
@@ -2148,6 +3556,12 @@ return [{"json": {"result": result}}]
         });
       });
 
+      it('does not suggest JMESPath backticks when $jmespath only appears in a string', () => {
+        context.config = { language: 'javaScript', jsCode: 'return [{json: {note: "see $jmespath docs"}}];' };
+        NodeSpecificValidators.validateCode(context);
+        expect(context.suggestions.some(s => s.includes('JMESPath'))).toBe(false);
+      });
+
       it('should error on JMESPath numeric literals without backticks', () => {
         context.config = {
           language: 'javaScript',
@@ -2159,8 +3573,8 @@ return [{"json": {"result": result}}]
         expect(context.errors).toContainEqual({
           type: 'invalid_value',
           property: 'jsCode',
-          message: 'JMESPath numeric literal 18 must be wrapped in backticks',
-          fix: 'Change [?field >= 18] to [?field >= `18`]'
+          message: 'JMESPath literal 18 must be wrapped in backticks',
+          fix: 'Write >= `18`'
         });
       });
     });
@@ -2308,6 +3722,73 @@ return [{"json": {"result": result}}]
 
         expect(context.autofix.onError).toBe('continueRegularOutput');
       });
+    });
+  });
+
+  describe('validateSet', () => {
+    it('should not warn when Set v3 has populated assignments', () => {
+      context.config = {
+        mode: 'manual',
+        assignments: {
+          assignments: [
+            { id: '1', name: 'status', value: 'active', type: 'string' }
+          ]
+        }
+      };
+
+      NodeSpecificValidators.validateSet(context);
+
+      const fieldWarnings = context.warnings.filter(w => w.message.includes('no fields configured'));
+      expect(fieldWarnings).toHaveLength(0);
+    });
+
+    it('should not warn when Set v2 has populated values', () => {
+      context.config = {
+        mode: 'manual',
+        values: {
+          string: [{ name: 'field', value: 'val' }]
+        }
+      };
+
+      NodeSpecificValidators.validateSet(context);
+
+      const fieldWarnings = context.warnings.filter(w => w.message.includes('no fields configured'));
+      expect(fieldWarnings).toHaveLength(0);
+    });
+
+    it('should warn when Set v3 has empty assignments array', () => {
+      context.config = {
+        mode: 'manual',
+        assignments: { assignments: [] }
+      };
+
+      NodeSpecificValidators.validateSet(context);
+
+      const fieldWarnings = context.warnings.filter(w => w.message.includes('no fields configured'));
+      expect(fieldWarnings).toHaveLength(1);
+    });
+
+    it('should warn when Set manual mode has no values or assignments', () => {
+      context.config = {
+        mode: 'manual'
+      };
+
+      NodeSpecificValidators.validateSet(context);
+
+      const fieldWarnings = context.warnings.filter(w => w.message.includes('no fields configured'));
+      expect(fieldWarnings).toHaveLength(1);
+    });
+
+    it('should not warn when Set manual mode has jsonOutput', () => {
+      context.config = {
+        mode: 'manual',
+        jsonOutput: '{"key":"value"}'
+      };
+
+      NodeSpecificValidators.validateSet(context);
+
+      const fieldWarnings = context.warnings.filter(w => w.message.includes('no fields configured'));
+      expect(fieldWarnings).toHaveLength(0);
     });
   });
 
@@ -2714,6 +4195,775 @@ Always be professional and concise.`;
             property: 'needsFallback'
           })
         );
+      });
+    });
+  });
+
+  describe('false-positive audit fixes', () => {
+    describe('Code node language field resolution', () => {
+      it('should read pythonCode when language is pythonNative', () => {
+        context.config = {
+          language: 'pythonNative',
+          pythonCode: 'return [{"json": {"count": len(_items)}}]'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const emptyErrors = context.errors.filter(e => e.message === 'Code cannot be empty');
+        expect(emptyErrors).toHaveLength(0);
+      });
+
+      it('should run Python-specific checks for pythonNative code', () => {
+        context.config = {
+          language: 'pythonNative',
+          pythonCode: 'data = _input.all()\nreturn [{"json": {"ok": True}}]'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.errors).toContainEqual(expect.objectContaining({
+          property: 'pythonCode',
+          message: '_input does not exist in native Python - it was removed with the Pyodide runtime'
+        }));
+      });
+
+      it('should still error on empty pythonNative code against the pythonCode field', () => {
+        context.config = {
+          language: 'pythonNative',
+          pythonCode: ''
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.errors).toContainEqual(expect.objectContaining({
+          property: 'pythonCode',
+          message: 'Code cannot be empty'
+        }));
+      });
+    });
+
+    describe('bare object return in runOnceForAllItems (n8n auto-wraps)', () => {
+      it('should not error on a bare object return', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const html = items[0].json.html;\nreturn { success: true, html };'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const returnErrors = context.errors.filter(e => e.message === 'Return value must be an array of objects');
+        expect(returnErrors).toHaveLength(0);
+      });
+
+      it('should not error on a bare object return in explicit runOnceForAllItems mode', () => {
+        context.config = {
+          language: 'javaScript',
+          mode: 'runOnceForAllItems',
+          jsCode: 'return {status: "ok"};'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const returnErrors = context.errors.filter(e => e.message === 'Return value must be an array of objects');
+        expect(returnErrors).toHaveLength(0);
+      });
+
+      it('should still error on primitive top-level returns', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'return "success";'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.errors).toContainEqual(expect.objectContaining({
+          message: 'Cannot return primitive values directly'
+        }));
+      });
+    });
+
+    describe('nested template literal interpolation', () => {
+      it('should find the top-level return when nested template literals are used', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: [
+            'const risks = items.map(i => i.json.risk);',
+            "const lines = `${risks.map((r, i) => `${i + 1}. Don't ignore: ${r}`).join('\\n')}`;",
+            'return [{ json: { lines } }];',
+          ].join('\n')
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const missingReturn = context.errors.filter(e => e.message === 'Code must return data for the next node');
+        expect(missingReturn).toHaveLength(0);
+      });
+
+      it('should not treat a return inside an interpolated arrow body as top-level', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const s = `${(() => { return 1; })()}`;\nreturn [{json: {s}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const primitiveErrors = context.errors.filter(e => e.message === 'Cannot return primitive values directly');
+        expect(primitiveErrors).toHaveLength(0);
+      });
+
+      it('should still require a return when code with nested template literals lacks one', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const t = `a${[1, 2].map(n => `${n}`).join(",")}b`;\nconsole.log(t);'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.errors).toContainEqual(expect.objectContaining({
+          message: 'Code must return data for the next node'
+        }));
+      });
+    });
+
+    describe('expression syntax check is string-aware', () => {
+      it('should not error when {{ }} appears inside a string literal', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const html = items[0].json.template.replace("{{ACCENT_COLOR}}", "#fff");\nreturn [{json: {html}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const exprErrors = context.errors.filter(e => e.message === 'Expression syntax {{...}} is not valid in Code nodes');
+        expect(exprErrors).toHaveLength(0);
+      });
+
+      it('should not error when {{ }} appears inside a prompt payload string', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: "const prompt = 'Respond with {{ \"status\": \"ok\" }} exactly';\nreturn [{json: {prompt}}];"
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const exprErrors = context.errors.filter(e => e.message === 'Expression syntax {{...}} is not valid in Code nodes');
+        expect(exprErrors).toHaveLength(0);
+      });
+
+      it('should not error when {{ }} appears inside a Python string', () => {
+        context.config = {
+          language: 'python',
+          pythonCode: 'template = "Hello {{ name }}"\nreturn [{"json": {"template": template}}]'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const exprErrors = context.errors.filter(e => e.message === 'Expression syntax {{...}} is not valid in Code nodes');
+        expect(exprErrors).toHaveLength(0);
+      });
+
+      it('should still error on real {{ }} expression syntax outside strings', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const name = {{$json.name}}; return [{json: {name}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.errors).toContainEqual(expect.objectContaining({
+          message: 'Expression syntax {{...}} is not valid in Code nodes'
+        }));
+      });
+    });
+
+    describe('invalid $ usage check is string/regex-aware', () => {
+      it('should not warn about a regex end anchor $', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const ok = /^(disabled|not_applicable|skipped)$/i.test(items[0].json.status);\nreturn [{json: {ok}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const dollarWarnings = context.warnings.filter(w => w.message === 'Invalid $ usage detected');
+        expect(dollarWarnings).toHaveLength(0);
+      });
+
+      it('should not warn about $ inside string literals', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const price = items[0].json.total + " costs $5.00";\nreturn [{json: {price}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const dollarWarnings = context.warnings.filter(w => w.message === 'Invalid $ usage detected');
+        expect(dollarWarnings).toHaveLength(0);
+      });
+
+      it('should still warn about a dangling $ even when template literals are present', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const label = `v${1 + 1}`;\nconst value = $;\nreturn [{json: {value, label}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.warnings).toContainEqual(expect.objectContaining({
+          message: 'Invalid $ usage detected'
+        }));
+      });
+    });
+
+    describe('helpers prefix check excludes member access', () => {
+      it('should not warn about this.helpers usage', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const buffer = await this.helpers.getBinaryDataBuffer(0, "data");\nreturn [{json: {size: buffer.length}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const helperWarnings = context.warnings.filter(w => w.message === 'Use $helpers not helpers');
+        expect(helperWarnings).toHaveLength(0);
+      });
+
+      it('should still warn on a truly bare helpers. reference', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const result = helpers.httpRequest({url: "https://example.com"});\nreturn [{json: {result}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.warnings).toContainEqual(expect.objectContaining({
+          message: 'Use $helpers not helpers'
+        }));
+      });
+    });
+
+    describe('fs/path security warning requires real module usage', () => {
+      it('should not warn about a data field named path', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const path = items[0].json.path;\nconst parts = path.split("/");\nreturn [{json: {parts}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const fsWarnings = context.warnings.filter(w => w.message === 'File system and process access not available in Code nodes');
+        expect(fsWarnings).toHaveLength(0);
+      });
+
+      it('should still warn on fs member access', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const data = fs.readFileSync("/tmp/x.txt");\nreturn [{json: {data}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.warnings).toContainEqual(expect.objectContaining({
+          message: 'File system and process access not available in Code nodes'
+        }));
+      });
+
+      it('should still warn on require of path module', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const path = require("path");\nreturn [{json: {dir: path.dirname("/a/b")}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.warnings).toContainEqual(expect.objectContaining({
+          message: 'File system and process access not available in Code nodes'
+        }));
+      });
+
+      it('should warn on dynamic import of fs', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const fs = await import("fs");\nreturn [{json: {}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.warnings).toContainEqual(expect.objectContaining({
+          message: 'File system and process access not available in Code nodes'
+        }));
+      });
+
+      it('should warn on dynamic import of child_process', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: "const cp = import('child_process');\nreturn [{json: {}}];"
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.warnings).toContainEqual(expect.objectContaining({
+          message: 'File system and process access not available in Code nodes'
+        }));
+      });
+    });
+
+    describe('eval/exec/Function security warnings require bare calls', () => {
+      it('should not warn about regex.exec()', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const m = /(\\d+)/.exec(items[0].json.text);\nreturn [{json: {m}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const execWarnings = context.warnings.filter(w => w.message.includes('Avoid exec()'));
+        expect(execWarnings).toHaveLength(0);
+      });
+
+      it('should not warn about identifiers that merely end in eval or Function', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const data = retrieval(items);\nconst fn = getUserFunction();\nreturn [{json: {data, fn}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const evalWarnings = context.warnings.filter(w => w.message.includes('Avoid eval()'));
+        const fnWarnings = context.warnings.filter(w => w.message.includes('Avoid Function constructor'));
+        expect(evalWarnings).toHaveLength(0);
+        expect(fnWarnings).toHaveLength(0);
+      });
+
+      it('should still warn on a bare exec() call', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'exec("ls -la");\nreturn [{json: {}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.warnings).toContainEqual(expect.objectContaining({
+          message: expect.stringContaining('Avoid exec()')
+        }));
+      });
+
+      it('should not warn when eval/exec appear only inside string literals', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const prompt = "Never call eval( or exec( in generated code";\nreturn [{json: {prompt}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const securityWarnings = context.warnings.filter(w =>
+          w.message.includes('Avoid eval()') || w.message.includes('Avoid exec()'));
+        expect(securityWarnings).toHaveLength(0);
+      });
+
+      it('should warn about eval() inside template-literal interpolation code', () => {
+        context.config = {
+          language: 'javaScript',
+          // eslint-disable-next-line no-template-curly-in-string
+          jsCode: 'const out = `result: ${eval(items[0].json.expr)}`;\nreturn [{json: {out}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.warnings).toContainEqual(expect.objectContaining({
+          message: expect.stringContaining('Avoid eval()')
+        }));
+      });
+
+      it('should warn about window.eval()', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const result = window.eval(items[0].json.code);\nreturn [{json: {result}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.warnings).toContainEqual(expect.objectContaining({
+          message: expect.stringContaining('Avoid eval()')
+        }));
+      });
+
+      it('should warn about globalThis.Function()', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const fn = globalThis.Function("return 1");\nreturn [{json: {result: fn()}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.warnings).toContainEqual(expect.objectContaining({
+          message: expect.stringContaining('Avoid Function constructor')
+        }));
+      });
+    });
+
+    describe('n8n variable checks scan inside function bodies', () => {
+      it('should warn on a bare helpers. reference inside a .map callback', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'return $input.all().map(item => {\n  const r = helpers.httpRequest({url: "https://example.com"});\n  return {json: r};\n});'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.warnings).toContainEqual(expect.objectContaining({
+          message: 'Use $helpers not helpers'
+        }));
+      });
+
+      it('should error on {{ }} expression syntax inside a callback body', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'return $input.all().map(item => {\n  const v = {{ item.json.count }};\n  return {json: {v}};\n});'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.errors).toContainEqual(expect.objectContaining({
+          message: 'Expression syntax {{...}} is not valid in Code nodes'
+        }));
+      });
+
+      it('should not error on {{ }} inside a callback string literal', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'return $input.all().map(item => {\n  const label = "Hello {{$json.name}}";\n  return {json: {label}};\n});'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const exprErrors = context.errors.filter(e => e.message === 'Expression syntax {{...}} is not valid in Code nodes');
+        expect(exprErrors).toHaveLength(0);
+      });
+
+      it('should not warn about a regex end anchor $ inside a callback', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'return $input.all().filter(item => {\n  return /end$/.test(item.json.status);\n}).map(item => ({json: item.json}));'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const dollarWarnings = context.warnings.filter(w => w.message === 'Invalid $ usage detected');
+        expect(dollarWarnings).toHaveLength(0);
+      });
+
+      it('should scan template-literal interpolation code inside a callback', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'return $input.all().map(item => {\n  const url = `https://api/${helpers.buildPath(item)}`;\n  return {json: {url}};\n});'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.warnings).toContainEqual(expect.objectContaining({
+          message: 'Use $helpers not helpers'
+        }));
+      });
+    });
+
+    describe('SQL keyword checks match statement positions', () => {
+      it('should not error on identifiers containing drop', () => {
+        context.config = {
+          operation: 'execute',
+          query: 'SELECT dropdown, drop_off_date FROM rides WHERE id = 1'
+        };
+
+        NodeSpecificValidators.validatePostgres(context);
+
+        const dropErrors = context.errors.filter(e => e.message.includes('DROP operations'));
+        expect(dropErrors).toHaveLength(0);
+      });
+
+      it('should not error on a deleted_at column read without WHERE', () => {
+        context.config = {
+          operation: 'execute',
+          query: 'SELECT deleted_at FROM logs'
+        };
+
+        NodeSpecificValidators.validatePostgres(context);
+
+        const deleteErrors = context.errors.filter(e => e.message.includes('DELETE query without WHERE'));
+        expect(deleteErrors).toHaveLength(0);
+      });
+
+      it('should downgrade DELETE without WHERE to a warning when the query is an expression', () => {
+        context.config = {
+          operation: 'execute',
+          query: 'DELETE FROM {{ $json.table }}'
+        };
+
+        NodeSpecificValidators.validatePostgres(context);
+
+        const deleteErrors = context.errors.filter(e => e.message.includes('DELETE query without WHERE'));
+        expect(deleteErrors).toHaveLength(0);
+        expect(context.warnings).toContainEqual(expect.objectContaining({
+          message: expect.stringContaining('DELETE query without WHERE')
+        }));
+      });
+
+      it('should downgrade DROP to a warning when the query is an expression', () => {
+        context.config = {
+          operation: 'execute',
+          query: '=DROP TABLE {{ $json.name }}'
+        };
+
+        NodeSpecificValidators.validatePostgres(context);
+
+        const dropErrors = context.errors.filter(e => e.message.includes('DROP operations'));
+        expect(dropErrors).toHaveLength(0);
+        expect(context.warnings).toContainEqual(expect.objectContaining({
+          message: expect.stringContaining('DROP operations')
+        }));
+      });
+
+      it('should still error on a literal DROP statement', () => {
+        context.config = {
+          operation: 'execute',
+          query: 'DROP TABLE users'
+        };
+
+        NodeSpecificValidators.validatePostgres(context);
+
+        expect(context.errors).toContainEqual(expect.objectContaining({
+          message: 'DROP operations are extremely dangerous and will permanently delete database objects'
+        }));
+      });
+
+      it('should still error on a literal DELETE without WHERE', () => {
+        context.config = {
+          operation: 'execute',
+          query: 'DELETE FROM users'
+        };
+
+        NodeSpecificValidators.validatePostgres(context);
+
+        expect(context.errors).toContainEqual(expect.objectContaining({
+          message: 'DELETE query without WHERE clause will delete all records'
+        }));
+      });
+
+      it('should not warn on an update column read without WHERE', () => {
+        context.config = {
+          operation: 'execute',
+          query: 'SELECT last_update FROM tasks'
+        };
+
+        NodeSpecificValidators.validatePostgres(context);
+
+        const updateWarnings = context.warnings.filter(w => w.message.includes('UPDATE query without WHERE'));
+        expect(updateWarnings).toHaveLength(0);
+      });
+
+      it('should not warn about a truncated_at column read', () => {
+        context.config = {
+          operation: 'execute',
+          query: 'SELECT truncated_at FROM logs'
+        };
+
+        NodeSpecificValidators.validatePostgres(context);
+
+        const truncateWarnings = context.warnings.filter(w => w.message.includes('TRUNCATE will remove all data'));
+        expect(truncateWarnings).toHaveLength(0);
+      });
+
+      it('should still warn on a literal UPDATE without WHERE', () => {
+        context.config = {
+          operation: 'execute',
+          query: 'UPDATE users SET active = true'
+        };
+
+        NodeSpecificValidators.validatePostgres(context);
+
+        expect(context.warnings).toContainEqual(expect.objectContaining({
+          message: 'UPDATE query without WHERE clause will update all records'
+        }));
+      });
+
+      it('should still warn on a literal TRUNCATE statement', () => {
+        context.config = {
+          operation: 'execute',
+          query: 'TRUNCATE TABLE users'
+        };
+
+        NodeSpecificValidators.validatePostgres(context);
+
+        expect(context.warnings).toContainEqual(expect.objectContaining({
+          message: 'TRUNCATE will remove all data from the table'
+        }));
+      });
+    });
+
+    describe('expression-valued JSON fields skip JSON.parse validation', () => {
+      it('should not error when a MongoDB find query is an n8n expression', () => {
+        context.config = {
+          operation: 'find',
+          collection: 'users',
+          query: '={{ JSON.stringify($json.filter) }}'
+        };
+
+        NodeSpecificValidators.validateMongoDB(context);
+
+        const queryErrors = context.errors.filter(e => e.message === 'Query must be valid JSON');
+        expect(queryErrors).toHaveLength(0);
+      });
+
+      it('should not error when a MongoDB find query contains {{ }} interpolation', () => {
+        context.config = {
+          operation: 'find',
+          collection: 'users',
+          query: '{"userId": {{ $json.id }}}'
+        };
+
+        NodeSpecificValidators.validateMongoDB(context);
+
+        const queryErrors = context.errors.filter(e => e.message === 'Query must be valid JSON');
+        expect(queryErrors).toHaveLength(0);
+      });
+
+      it('should not error when Set jsonOutput is an n8n expression', () => {
+        context.config = {
+          jsonOutput: '={{ $json.data }}'
+        };
+
+        NodeSpecificValidators.validateSet(context);
+
+        const jsonErrors = context.errors.filter(e => e.property === 'jsonOutput' && e.type === 'syntax_error');
+        expect(jsonErrors).toHaveLength(0);
+      });
+
+      it('should not error when Set jsonOutput contains {{ }} interpolation', () => {
+        context.config = {
+          jsonOutput: '{"name": "{{ $json.name }}", "count": {{ $json.count }}}'
+        };
+
+        NodeSpecificValidators.validateSet(context);
+
+        const jsonErrors = context.errors.filter(e => e.property === 'jsonOutput' && e.type === 'syntax_error');
+        expect(jsonErrors).toHaveLength(0);
+      });
+
+      it('should still error on genuinely invalid JSON in Set jsonOutput', () => {
+        context.config = {
+          jsonOutput: '{invalid'
+        };
+
+        NodeSpecificValidators.validateSet(context);
+
+        expect(context.errors).toContainEqual(expect.objectContaining({
+          type: 'syntax_error',
+          property: 'jsonOutput'
+        }));
+      });
+    });
+
+    describe('code input-reference warning', () => {
+      it('should not warn when code references input via $(...)', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: "const data = $('Get Activity').first().json;\nreturn [{json: data}];"
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const inputWarnings = context.warnings.filter(w => w.message === 'Code doesn\'t reference input data');
+        expect(inputWarnings).toHaveLength(0);
+      });
+
+      it('should not warn when code uses workflow static data', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: "const s = $getWorkflowStaticData('global');\ns.counter = (s.counter || 0) + 1;\nreturn [{json: {counter: s.counter}}];"
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const inputWarnings = context.warnings.filter(w => w.message === 'Code doesn\'t reference input data');
+        expect(inputWarnings).toHaveLength(0);
+      });
+
+      it('should not warn when code references workflow context variables', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const runId = $execution.id;\nreturn [{json: {runId, startedAt: new Date().toISOString()}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const inputWarnings = context.warnings.filter(w => w.message === 'Code doesn\'t reference input data');
+        expect(inputWarnings).toHaveLength(0);
+      });
+
+      it('should emit the no-input warning with best_practice type so profiles can gate it', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const result = Math.random(); return [{json: {result}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        expect(context.warnings).toContainEqual(expect.objectContaining({
+          type: 'best_practice',
+          message: 'Code doesn\'t reference input data'
+        }));
+      });
+
+      it('should warn when input patterns appear only inside string literals', () => {
+        context.config = {
+          language: 'javaScript',
+          jsCode: 'const note = "this code never reads $json or $input directly";\nreturn [{json: {note, id: Math.random()}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const inputWarnings = context.warnings.filter(w => w.message === 'Code doesn\'t reference input data');
+        expect(inputWarnings).toHaveLength(1);
+      });
+
+      it('should not warn when input is referenced inside template-literal interpolation', () => {
+        context.config = {
+          language: 'javaScript',
+          // eslint-disable-next-line no-template-curly-in-string
+          jsCode: 'const greeting = `Hello ${$json.name}, welcome back to the workflow`;\nreturn [{json: {greeting}}];'
+        };
+
+        NodeSpecificValidators.validateCode(context);
+
+        const inputWarnings = context.warnings.filter(w => w.message === 'Code doesn\'t reference input data');
+        expect(inputWarnings).toHaveLength(0);
+      });
+    });
+
+    describe('Google Sheets read does not require range', () => {
+      it('should not error when a read operation has no range', () => {
+        context.config = {
+          operation: 'read',
+          sheetId: '1234567890'
+        };
+
+        NodeSpecificValidators.validateGoogleSheets(context);
+
+        const rangeErrors = context.errors.filter(e => e.property === 'range');
+        expect(rangeErrors).toHaveLength(0);
+      });
+
+      it('should still require range or columns mapping for append', () => {
+        context.config = {
+          operation: 'append',
+          sheetId: '1234567890'
+        };
+
+        NodeSpecificValidators.validateGoogleSheets(context);
+
+        expect(context.errors).toContainEqual(expect.objectContaining({
+          property: 'range',
+          message: 'Range or columns mapping is required for append operation'
+        }));
       });
     });
   });

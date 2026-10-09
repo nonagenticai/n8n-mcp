@@ -3,6 +3,7 @@ export * from './node-types';
 export * from './type-structures';
 export * from './instance-context';
 export * from './session-state';
+export * from './additional-tools';
 
 export interface MCPServerConfig {
   port: number;
@@ -44,6 +45,14 @@ export interface ToolDefinition {
   };
   /** Tool behavior hints for AI assistants */
   annotations?: ToolAnnotations;
+  _meta?: {
+    ui?: {
+      resourceUri?: string;
+    };
+    /** Claude Code per-tool override for the default result-size cap (see code.claude.com/docs/en/mcp). */
+    'anthropic/maxResultSizeChars'?: number;
+    [key: string]: unknown;
+  };
 }
 
 export interface ResourceDefinition {

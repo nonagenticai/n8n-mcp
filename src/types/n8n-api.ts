@@ -31,15 +31,20 @@ export interface WorkflowNode {
   alwaysOutputData?: boolean;
   executeOnce?: boolean;
   webhookId?: string; // n8n assigns this for webhook/form/chat trigger nodes
+  /** Node-level telemetry tags, accepted by n8n's node write schema since 2.36. */
+  customTelemetryTags?: { tag?: Array<{ key: string; value: string }> };
 }
 
 export interface WorkflowConnection {
   [sourceNodeId: string]: {
+    // A null branch is n8n's own "nothing wired to this output", matching its
+    // `NodeInputConnections = Array<IConnection[] | null>`; the Public API stores one
+    // verbatim, so a workflow read back can carry one (#1096).
     [outputType: string]: Array<Array<{
       node: string;
       type: string;
       index: number;
-    }>>;
+    }> | null>;
   };
 }
 
@@ -54,12 +59,48 @@ export interface WorkflowSettings {
   errorWorkflow?: string;
 }
 
+/**
+ * n8n's draft/publish model surfaces the currently-published version of a workflow
+ * alongside the working draft. `nodes`/`connections` on the workflow itself are the
+ * draft (latest edits in the editor); `activeVersion.nodes`/`activeVersion.connections`
+ * are the published graph that actually runs.
+ *
+ * Only the fields we read are declared; n8n returns additional keys (versionId,
+ * authors, autosaved, workflowPublishHistory, etc.) — add them here when a consumer
+ * actually needs them.
+ */
+export interface ActiveWorkflowVersion {
+  nodes: WorkflowNode[];
+  connections: WorkflowConnection;
+  nodeGroups?: WorkflowNodeGroup[]; // Canvas groups as they were in this published version
+  name?: string | null;
+  createdAt?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * A canvas group ("Group nodes", n8n 2.28+): a named frame drawn around a connected run of
+ * non-trigger nodes. Purely presentational, but n8n validates group membership on every write —
+ * see src/services/node-groups.ts.
+ *
+ * `description` only exists on n8n 2.32+; older instances reject it (the group schema is
+ * `additionalProperties: false`).
+ */
+export interface WorkflowNodeGroup {
+  id: string;
+  name: string;
+  nodeIds: string[]; // node IDs, not names — connections are keyed by name
+  description?: string;
+}
+
 export interface Workflow {
   id?: string;
   name: string;
   description?: string; // Returned by GET but must be excluded from PUT/PATCH (n8n API limitation, Issue #431)
+  parentFolderId?: string | null; // Write-only (n8n 2.32+): create places into a folder, update moves (null = project root). Never present in GET responses.
   nodes: WorkflowNode[];
   connections: WorkflowConnection;
+  nodeGroups?: WorkflowNodeGroup[]; // Canvas groups (n8n 2.28+); absent on older instances
   active?: boolean; // Optional for creation as it's read-only
   isArchived?: boolean; // Optional, available in newer n8n versions
   settings?: WorkflowSettings;
@@ -69,6 +110,8 @@ export interface Workflow {
   createdAt?: string;
   versionId?: string;
   versionCounter?: number; // Added: n8n 1.118.1+ returns this in GET responses
+  activeVersionId?: string | null; // n8n draft/publish: pointer to the published version
+  activeVersion?: ActiveWorkflowVersion | null; // n8n draft/publish: published graph (heavy, omitted from GET responses by default)
   meta?: {
     instanceId?: string;
   };
@@ -133,6 +176,67 @@ export interface Tag {
   updatedAt?: string;
 }
 
+// Folder Types (n8n public API 2.19+; workflow placement via parentFolderId needs 2.32+)
+
+/**
+ * A workflow folder as returned by /projects/{projectId}/folders.
+ * List responses include only the fields named in the request's `select`;
+ * the detail endpoint adds recursive totals instead.
+ */
+export interface Folder {
+  id: string;
+  name: string;
+  parentFolderId?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+  // Present only when requested via `select` on the list endpoint
+  parentFolder?: { id: string; name: string } | null;
+  project?: { id: string; name: string; type?: string };
+  tags?: Array<{ id: string; name: string }>;
+  workflowCount?: number; // Direct children only
+  subFolderCount?: number; // Direct children only
+  path?: string[]; // Folder names from root to this folder
+  // Present only on the detail endpoint
+  totalSubFolders?: number; // Recursive
+  totalWorkflows?: number; // Recursive
+}
+
+export interface FolderListFilter {
+  parentFolderId?: string;
+  name?: string;
+  tags?: string[];
+  excludeFolderIdAndDescendants?: string;
+}
+
+export interface FolderListParams {
+  filter?: FolderListFilter;
+  select?: string[];
+  sortBy?: 'name:asc' | 'name:desc' | 'createdAt:asc' | 'createdAt:desc' | 'updatedAt:asc' | 'updatedAt:desc';
+  skip?: number;
+  take?: number;
+}
+
+export interface FolderListResponse {
+  count: number;
+  data: Folder[];
+}
+
+/** Minimal project shape from GET /projects (used only to resolve the `personal` alias). */
+export interface ProjectSummary {
+  id: string;
+  name: string;
+  type?: string;
+}
+
+/** Project shape returned by `listProjects()` (GET /projects). */
+export interface Project {
+  id: string;
+  name: string;
+  type?: 'personal' | 'team' | string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
 // Variable Types
 export interface Variable {
   id?: string;
@@ -150,6 +254,7 @@ export interface WorkflowExport {
   updatedAt: string;
   nodes: WorkflowNode[];
   connections: WorkflowConnection;
+  nodeGroups?: WorkflowNodeGroup[];
   settings?: WorkflowSettings;
   staticData?: Record<string, unknown>;
   tags?: string[];
@@ -163,53 +268,11 @@ export interface WorkflowImport {
   name: string;
   nodes: WorkflowNode[];
   connections: WorkflowConnection;
+  nodeGroups?: WorkflowNodeGroup[];
   settings?: WorkflowSettings;
   staticData?: Record<string, unknown>;
   tags?: string[];
   pinData?: Record<string, unknown>;
-}
-
-// Source Control Types
-export interface SourceControlStatus {
-  ahead: number;
-  behind: number;
-  conflicted: string[];
-  created: string[];
-  current: string;
-  deleted: string[];
-  detached: boolean;
-  files: Array<{
-    path: string;
-    status: string;
-  }>;
-  modified: string[];
-  notAdded: string[];
-  renamed: Array<{
-    from: string;
-    to: string;
-  }>;
-  staged: string[];
-  tracking: string;
-}
-
-export interface SourceControlPullResult {
-  conflicts: string[];
-  files: Array<{
-    path: string;
-    status: string;
-  }>;
-  mergeConflicts: boolean;
-  pullResult: 'success' | 'conflict' | 'error';
-}
-
-export interface SourceControlPushResult {
-  ahead: number;
-  conflicts: string[];
-  files: Array<{
-    path: string;
-    status: string;
-  }>;
-  pushResult: 'success' | 'conflict' | 'error';
 }
 
 // Health Check Types
@@ -277,10 +340,83 @@ export interface ExecutionListResponse {
   nextCursor?: string | null;
 }
 
+// Evaluation test runs (n8n Public API >= 2.30)
+export type TestRunStatus = 'new' | 'running' | 'completed' | 'error' | 'cancelled';
+export type TestRunFinalResult = 'success' | 'error' | 'warning';
+export type TestCaseExecutionStatus =
+  | 'new'
+  | 'running'
+  | 'evaluation_running'
+  | 'success'
+  | 'error'
+  | 'warning'
+  | 'cancelled';
+
+export interface TestRunSummary {
+  id: string;
+  status: TestRunStatus;
+  runAt: string | null;
+  completedAt: string | null;
+  metrics: Record<string, number | boolean> | null;
+  errorCode: string | null;
+  errorDetails: Record<string, unknown> | null;
+  finalResult: TestRunFinalResult | null;
+  testCaseCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TestCaseExecution {
+  id: string;
+  status: TestCaseExecutionStatus;
+  runAt: string | null;
+  completedAt: string | null;
+  metrics: Record<string, number | boolean> | null;
+  errorCode: string | null;
+  errorDetails: Record<string, unknown> | null;
+  inputs: Record<string, unknown> | null;
+  outputs: Record<string, unknown> | null;
+  // n8n 2.42+ documents this as an integer; earlier releases declared a string.
+  executionId: number | string | null;
+}
+
+// Returned by the trigger/cancel routes (n8n Public API >= 2.32), which answer
+// with the run identity only - poll the get route for metrics.
+export interface TestRunTriggerResult {
+  id: string;
+  status: TestRunStatus;
+  createdAt: string;
+}
+
+export interface TestRunCancelResult {
+  id: string;
+  status: 'cancelled';
+}
+
+export interface TestRunListParams {
+  status?: TestRunStatus;
+  limit?: number;
+  cursor?: string;
+}
+
+export interface TestCaseListParams {
+  limit?: number;
+  cursor?: string;
+}
+
+export interface TestRunListResponse {
+  data: TestRunSummary[];
+  nextCursor?: string | null;
+}
+
+export interface TestCaseListResponse {
+  data: TestCaseExecution[];
+  nextCursor?: string | null;
+}
+
 export interface CredentialListParams {
   limit?: number;
   cursor?: string;
-  filter?: Record<string, unknown>;
 }
 
 export interface CredentialListResponse {
@@ -311,6 +447,7 @@ export interface WebhookRequest {
 // MCP Tool Response Type
 export interface McpToolResponse {
   success: boolean;
+  saved?: boolean;
   data?: unknown;
   error?: string;
   message?: string;
@@ -318,6 +455,35 @@ export interface McpToolResponse {
   details?: Record<string, unknown>;
   executionId?: string;
   workflowId?: string;
+  operationsApplied?: number;
+  // Official-MCP-backed tools (e.g. n8n_manage_agents) — the action that was
+  // requested, the official tool name it was dispatched to, a human-readable
+  // hint, the raw official error payload on failure, and whether the result
+  // was truncated to the size cap.
+  action?: string;
+  officialTool?: string;
+  hint?: string;
+  officialError?: unknown;
+  truncated?: boolean;
+  // n8n_manage_agents: the personal project ID filled in for an omitted or
+  // `personal` args.projectId.
+  defaultedProjectId?: string;
+  // n8n_list_catalog: which catalog was listed ('projects' | 'tags') and
+  // which backend answered ('public-api' | 'official-mcp' | 'n8n-mcp').
+  kind?: string;
+  backend?: string;
+  // Routed workflow-side operations: which route ran (`method` for
+  // n8n_test_workflow, `source` for n8n_workflow_versions, `mode` for the
+  // requested sub-operation), whether the consent flow had to enable
+  // "Available in MCP" on the workflow, a validation report attached to the
+  // result, and non-fatal warnings from the call (e.g. canvas-group repairs
+  // reported by a workflow write).
+  method?: string;
+  source?: string;
+  mode?: string;
+  exposedToMcp?: boolean;
+  validation?: unknown;
+  warnings?: string[];
 }
 
 // Execution Filtering Types
@@ -397,9 +563,16 @@ export interface FilteredNodeData {
   status: 'success' | 'error';
   error?: string;
   data?: {
-    input?: any[][];
-    output?: any[][];
+    /** Branches are `null` where n8n recorded no data on that port. */
+    input?: Array<any[] | null>;
+    output?: Array<any[] | null>;
     metadata: {
+      totalItems: number;
+      itemsShown: number;
+      truncated: boolean;
+    };
+    /** In summary and filtered modes, with `input`: inputs obey the same item limit, since AI sub-nodes fill them with whole prompts. */
+    inputMetadata?: {
       totalItems: number;
       itemsShown: number;
       truncated: boolean;
@@ -452,4 +625,82 @@ export interface ErrorSuggestion {
   title: string;
   description: string;
   confidence: 'high' | 'medium' | 'low';
+}
+
+// Data Table types
+export interface DataTableColumn {
+  name: string;
+  type?: 'string' | 'number' | 'boolean' | 'date';
+}
+
+export interface DataTableColumnResponse {
+  id: string;
+  name: string;
+  type: 'string' | 'number' | 'boolean' | 'date';
+  index: number;
+}
+
+export interface DataTable {
+  id: string;
+  name: string;
+  columns?: DataTableColumnResponse[];
+  projectId?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface DataTableRow {
+  id?: number;
+  createdAt?: string;
+  updatedAt?: string;
+  [columnName: string]: unknown;
+}
+
+export interface DataTableFilterCondition {
+  columnName: string;
+  condition: 'eq' | 'neq' | 'like' | 'ilike' | 'gt' | 'gte' | 'lt' | 'lte';
+  value?: any;
+}
+
+export interface DataTableFilter {
+  type?: 'and' | 'or';
+  filters: DataTableFilterCondition[];
+}
+
+export interface DataTableListParams {
+  limit?: number;
+  cursor?: string;
+}
+
+export interface DataTableRowListParams {
+  limit?: number;
+  cursor?: string;
+  filter?: string;
+  sortBy?: string;
+  search?: string;
+}
+
+export interface DataTableInsertRowsParams {
+  data: Record<string, unknown>[];
+  returnType?: 'count' | 'id' | 'all';
+}
+
+export interface DataTableUpdateRowsParams {
+  filter: DataTableFilter;
+  data: Record<string, unknown>;
+  returnData?: boolean;
+  dryRun?: boolean;
+}
+
+export interface DataTableUpsertRowParams {
+  filter: DataTableFilter;
+  data: Record<string, unknown>;
+  returnData?: boolean;
+  dryRun?: boolean;
+}
+
+export interface DataTableDeleteRowsParams {
+  filter: string;
+  returnData?: boolean;
+  dryRun?: boolean;
 }

@@ -1,6 +1,8 @@
 import { logger } from '../utils/logger';
+import { NPM_MISSING_README_PLACEHOLDER } from '../constants/npm-readme';
 import { NodeRepository, CommunityNodeFields } from '../database/node-repository';
 import { ParsedNode } from '../parsers/node-parser';
+import { parseTypeVersion } from '../utils/typeversion';
 import {
   CommunityNodeFetcher,
   StrapiCommunityNode,
@@ -21,9 +23,16 @@ export interface SyncResult {
     errors: string[];
   };
   npm: {
+    /** Packages returned by the registry search */
     fetched: number;
+    /** Packages written */
     saved: number;
+    /** Packages left untouched */
     skipped: number;
+    /** Rows written — a package can ship several nodes */
+    nodesSaved: number;
+    /** Rows dropped because the package no longer declares them */
+    nodesRemoved: number;
     errors: string[];
   };
   duration: number;
@@ -38,6 +47,61 @@ export interface SyncOptions {
   skipExisting?: boolean;
   /** Environment for Strapi API */
   environment?: 'production' | 'staging';
+}
+
+/**
+ * package.json lookups during the npm sync are best-effort: one attempt with a
+ * short timeout. A miss falls back to the package-name heuristic, so a slow
+ * registry must not stretch a sync of hundreds of packages by hours.
+ */
+const NPM_MANIFEST_FETCH = { maxRetries: 1, timeout: 5000 } as const;
+
+/**
+ * Upper bound on the rows a single npm package may contribute. The manifest is
+ * arbitrary third-party input; a package declaring thousands of entries would
+ * otherwise fill the shipped database and overrun SQLite's variable limit in the
+ * set-diff.
+ */
+const MAX_NODES_PER_PACKAGE = 100;
+
+/**
+ * Where an npm package's node names came from.
+ * - `manifest`: parsed from the package's own `n8n.nodes` array — authoritative.
+ * - `fallback`: package.json was read but declares no usable node entry, so the
+ *   names are the package-name heuristic.
+ * - `unavailable`: package.json could not be read at all. The names are the same
+ *   heuristic, but nothing about the package's real nodes is known, so stored
+ *   rows must not be re-keyed against them.
+ */
+type NpmNodeNameSource = 'manifest' | 'fallback' | 'unavailable';
+
+interface ResolvedNpmNodeNames {
+  names: string[];
+  source: NpmNodeNameSource;
+}
+
+/**
+ * Derive a node name from an n8n node entry point declared in package.json.
+ * e.g., "dist/nodes/GlobalConstants/GlobalConstants.node.js" -> "globalConstants"
+ * Returns undefined when the entry is not a node file.
+ */
+function extractNodeNameFromEntryPath(entryPath: string): string | undefined {
+  const match = /([^\\/]+)\.node\.(?:js|ts)$/.exec(entryPath);
+  if (!match) {
+    return undefined;
+  }
+
+  const className = match[1];
+
+  // A leading acronym is lowercased as a unit: PDFGeneration publishes as
+  // pdfGeneration, while plain PascalCase keeps the single-letter form
+  // (GlobalConstants -> globalConstants).
+  const acronym = /^[A-Z]+(?=[A-Z][a-z])/.exec(className);
+  if (acronym) {
+    return acronym[0].toLowerCase() + className.slice(acronym[0].length);
+  }
+
+  return className.charAt(0).toLowerCase() + className.slice(1);
 }
 
 /**
@@ -65,7 +129,7 @@ export class CommunityNodeService {
     const startTime = Date.now();
     const result: SyncResult = {
       verified: { fetched: 0, saved: 0, skipped: 0, errors: [] },
-      npm: { fetched: 0, saved: 0, skipped: 0, errors: [] },
+      npm: { fetched: 0, saved: 0, skipped: 0, nodesSaved: 0, nodesRemoved: 0, errors: [] },
       duration: 0,
     };
 
@@ -93,7 +157,8 @@ export class CommunityNodeService {
     result.duration = Date.now() - startTime;
     logger.info(
       `Community node sync complete in ${(result.duration / 1000).toFixed(1)}s: ` +
-        `${result.verified.saved} verified, ${result.npm.saved} npm`
+        `${result.verified.saved} verified, ` +
+        `${result.npm.nodesSaved} npm node(s) from ${result.npm.saved} package(s)`
     );
 
     return result;
@@ -167,7 +232,14 @@ export class CommunityNodeService {
     progressCallback?: (message: string, current: number, total: number) => void,
     skipExisting?: boolean
   ): Promise<SyncResult['npm']> {
-    const result = { fetched: 0, saved: 0, skipped: 0, errors: [] as string[] };
+    const result = {
+      fetched: 0,
+      saved: 0,
+      skipped: 0,
+      nodesSaved: 0,
+      nodesRemoved: 0,
+      errors: [] as string[],
+    };
 
     // Fetch npm packages
     const npmPackages = await this.fetcher.fetchNpmPackages(limit, progressCallback);
@@ -200,19 +272,53 @@ export class CommunityNodeService {
           continue;
         }
 
-        // Skip if already exists and skipExisting is true
-        if (skipExisting && this.repository.hasNodeByNpmPackage(packageName)) {
+        const existingRows = this.repository.getNodesByNpmPackage(packageName);
+        const resolved = await this.resolveNpmNodeNames(packageName, pkg.package.version);
+
+        // A registry miss yields the package-name heuristic, which says nothing
+        // about the nodes the package actually ships. Re-keying stored rows
+        // against it would delete correct rows and reinstate a fabricated type
+        // (#949), so leave the package alone until a manifest can be read.
+        if (resolved.source === 'unavailable' && existingRows.length > 0) {
+          logger.warn(
+            `Skipping ${packageName}: package.json unavailable, keeping ${existingRows.length} stored row(s)`
+          );
           result.skipped++;
           continue;
         }
 
         // For npm packages, we create a basic node entry with metadata
         // Full schema extraction would require downloading and parsing the tarball
-        const parsedNode = this.npmPackageToParsedNode(pkg);
+        const parsedNodes = this.npmPackageToParsedNodes(pkg, resolved);
+        const nodeTypes = parsedNodes.map((node) => node.nodeType);
+        const staleRows = this.staleCommunityRows(existingRows, nodeTypes);
 
-        // Save to database
-        this.repository.saveNode(parsedNode);
+        // Skip if already exists and skipExisting is true. Stored rows that no
+        // longer match the resolved set are the one case that must not be
+        // skipped — only a re-sync corrects them.
+        const upToDate =
+          existingRows.length > 0 && !this.rowsOutOfSync(existingRows, nodeTypes, staleRows);
+        if (skipExisting && upToDate) {
+          result.skipped++;
+          continue;
+        }
+
+        // One package, one unit of work: a partial write would leave both the new
+        // and the stale rows in search results, and rows saved without their docs
+        // look current to the next --update run.
+        const removed = this.repository.transaction(() => {
+          for (const parsedNode of parsedNodes) {
+            this.repository.saveNode(parsedNode);
+          }
+
+          const pruned = this.pruneStaleCommunityRows(packageName, staleRows, nodeTypes);
+          this.carryOverPackageDocs(existingRows, nodeTypes);
+          return pruned;
+        });
+
         result.saved++;
+        result.nodesSaved += parsedNodes.length;
+        result.nodesRemoved += removed;
 
         if (progressCallback) {
           progressCallback(`Saving npm packages`, result.saved + result.skipped, npmPackages.length);
@@ -222,7 +328,10 @@ export class CommunityNodeService {
       }
     }
 
-    logger.info(`npm packages: ${result.saved} saved, ${result.skipped} skipped`);
+    logger.info(
+      `npm packages: ${result.saved} saved (${result.nodesSaved} node row(s), ` +
+        `${result.nodesRemoved} removed), ${result.skipped} skipped`
+    );
     return result;
   }
 
@@ -256,11 +365,16 @@ export class CommunityNodeService {
       nodeType = nodeType.replace('n8n-nodes-preview-', 'n8n-nodes-');
     }
 
-    // Determine if it's an AI tool
-    const isAITool =
-      nodeDesc.usableAsTool === true ||
-      nodeDesc.codex?.categories?.includes('AI') ||
-      attributes.name?.toLowerCase().includes('ai');
+    // n8n types usableAsTool as `true | UsableAsToolDescription`, so any value
+    // other than false/absent is a declared capability, matching the core parser.
+    // The codex AI category stays as an inference because community metadata
+    // often omits usableAsTool. The node's name is never a signal: "ai" as a
+    // substring matches packages like fireflies*ai* that are not tools (#954).
+    const usableAsTool = nodeDesc.usableAsTool;
+    const declaresToolUse =
+      usableAsTool !== undefined && usableAsTool !== null && usableAsTool !== false;
+    const hasAICategory = nodeDesc.codex?.categories?.includes('AI') ?? false;
+    const isAITool = declaresToolUse || hasAICategory;
 
     return {
       // Core ParsedNode fields
@@ -280,7 +394,9 @@ export class CommunityNodeService {
         nodeDesc.group?.includes('webhook') ||
         false,
       isVersioned: (attributes.nodeVersions?.length || 0) > 1,
-      version: nodeDesc.version?.toString() || attributes.npmVersion || '1',
+      // typeVersion is the descriptor's version, NOT the npm package version.
+      // npm version (e.g. "0.2.21") is exposed separately via npmVersion below.
+      version: (parseTypeVersion(nodeDesc.version) ?? 1).toString(),
       outputs: nodeDesc.outputs,
       outputNames: nodeDesc.outputNames,
 
@@ -297,19 +413,24 @@ export class CommunityNodeService {
   }
 
   /**
-   * Convert npm package info to basic ParsedNode.
-   * Note: This is a minimal entry - full schema requires tarball parsing.
+   * Convert npm package info to one basic ParsedNode per node the package ships.
+   * Note: These are minimal entries - full schema requires tarball parsing.
+   * Everything except the node name and type is package-level and shared.
    */
-  private npmPackageToParsedNode(pkg: NpmSearchResult): ParsedNode & CommunityNodeFields {
+  private npmPackageToParsedNodes(
+    pkg: NpmSearchResult,
+    resolved: ResolvedNpmNodeNames
+  ): (ParsedNode & CommunityNodeFields)[] {
     const { package: pkgInfo, score } = pkg;
 
-    // Extract node name from package name (e.g., n8n-nodes-globals -> GlobalConstants)
-    const nodeName = this.extractNodeNameFromPackage(pkgInfo.name);
-    const nodeType = `${pkgInfo.name}.${nodeName}`;
+    // Once a package resolves to several nodes, each row's own name is the only
+    // signal that tells them apart — the package name would flag every row of
+    // n8n-nodes-foo-trigger as a trigger. A single row keeps both signals.
+    const perNodeSignal = resolved.names.length > 1;
 
-    return {
+    return resolved.names.map((nodeName) => ({
       // Core ParsedNode fields (minimal - no schema available)
-      nodeType,
+      nodeType: `${pkgInfo.name}.${nodeName}`,
       packageName: pkgInfo.name,
       displayName: nodeName,
       description: pkgInfo.description || `Community node from ${pkgInfo.name}`,
@@ -319,10 +440,13 @@ export class CommunityNodeService {
       credentials: [],
       operations: [],
       isAITool: false,
-      isTrigger: pkgInfo.name.includes('trigger'),
-      isWebhook: pkgInfo.name.includes('webhook'),
+      isTrigger: this.matchesRole(pkgInfo.name, nodeName, 'trigger', perNodeSignal),
+      isWebhook: this.matchesRole(pkgInfo.name, nodeName, 'webhook', perNodeSignal),
       isVersioned: false,
-      version: pkgInfo.version,
+      // No descriptor available without parsing the npm tarball — declarative community
+      // nodes default to typeVersion 1 at runtime when version isn't declared.
+      // npm package version is preserved in the npmVersion field below.
+      version: '1',
 
       // Community-specific fields
       isCommunity: true,
@@ -333,7 +457,24 @@ export class CommunityNodeService {
       npmVersion: pkgInfo.version,
       npmDownloads: Math.round(score.detail.popularity * 10000), // Approximate
       communityFetchedAt: new Date().toISOString(),
-    };
+    }));
+  }
+
+  /**
+   * Decide whether an npm-only node plays a role (trigger, webhook) from the
+   * names available. Only the node's own name counts once the package resolves
+   * to several nodes; see npmPackageToParsedNodes.
+   */
+  private matchesRole(
+    packageName: string,
+    nodeName: string,
+    role: string,
+    perNodeSignal: boolean
+  ): boolean {
+    if (nodeName.toLowerCase().includes(role)) {
+      return true;
+    }
+    return perNodeSignal ? false : packageName.includes(role);
   }
 
   /**
@@ -343,15 +484,147 @@ export class CommunityNodeService {
     const operations: any[] = [];
 
     // Check properties for resource/operation pattern
+    // Nodes can have multiple operation properties, each mapped to a resource via displayOptions
     if (nodeDesc.properties) {
       for (const prop of nodeDesc.properties) {
-        if (prop.name === 'operation' && prop.options) {
-          operations.push(...prop.options);
+        if ((prop.name === 'operation' || prop.name === 'action') && prop.options) {
+          const resource = prop.displayOptions?.show?.resource?.[0];
+          for (const op of prop.options) {
+            operations.push({
+              ...op,
+              ...(resource ? { resource } : {})
+            });
+          }
         }
       }
     }
 
     return operations;
+  }
+
+  /**
+   * The stored rows for a package are out of sync when this sync resolves a node
+   * type the package has no row for, or when an unverified row is keyed by a type
+   * the package no longer declares — the shape left behind by the fabricated
+   * package-name types (#949) and by the one-row-per-package sync (#967).
+   * Verified rows carry the real node name from Strapi and are never re-keyed.
+   */
+  private rowsOutOfSync(existingRows: any[], nodeTypes: string[], staleRows: any[]): boolean {
+    const storedTypes = new Set(existingRows.map((row) => row.nodeType));
+    return nodeTypes.some((nodeType) => !storedTypes.has(nodeType)) || staleRows.length > 0;
+  }
+
+  private staleCommunityRows(existingRows: any[], nodeTypes: string[]): any[] {
+    const keep = new Set(nodeTypes);
+    return existingRows.filter(
+      (row) => row.isCommunity && !row.isVerified && row.nodeType && !keep.has(row.nodeType)
+    );
+  }
+
+  /**
+   * Drop the rows this package no longer resolves to, returning how many went.
+   */
+  private pruneStaleCommunityRows(
+    packageName: string,
+    staleRows: any[],
+    nodeTypes: string[]
+  ): number {
+    if (staleRows.length === 0) {
+      return 0;
+    }
+
+    const removed = this.repository.deleteStaleCommunityNodes(packageName, nodeTypes);
+    logger.info(
+      `${packageName}: removed ${removed} row(s) the package no longer declares ` +
+        `(${staleRows.map((row) => row.nodeType).join(', ')})`
+    );
+    return removed;
+  }
+
+  /**
+   * Documentation is generated per package but stored per row, so a row this sync
+   * re-keyed or added arrives empty — saveNode only preserves docs under the same
+   * node type. Seed those rows from whatever the package already had.
+   */
+  private carryOverPackageDocs(existingRows: any[], nodeTypes: string[]): void {
+    // npm's missing-README placeholder is not documentation, and neither is a summary generated from it.
+    const documentedRows = existingRows.filter((row) => row.npmReadme !== NPM_MISSING_README_PLACEHOLDER);
+    const readme = documentedRows.find((row) => row.npmReadme)?.npmReadme;
+    const summary = documentedRows.find((row) => row.aiDocumentationSummary)?.aiDocumentationSummary;
+    if (!readme && !summary) {
+      return;
+    }
+
+    const storedByType = new Map(existingRows.map((row) => [row.nodeType, row]));
+    for (const nodeType of nodeTypes) {
+      const stored = storedByType.get(nodeType);
+      // A row that stores the placeholder has no real docs: its README and summary are replaced.
+      const storesPlaceholder = stored?.npmReadme === NPM_MISSING_README_PLACEHOLDER;
+      if (readme && (!stored?.npmReadme || storesPlaceholder)) {
+        this.repository.updateNodeReadme(nodeType, readme, { clearSummary: storesPlaceholder });
+      }
+      if (summary && (!stored?.aiDocumentationSummary || storesPlaceholder)) {
+        this.repository.updateNodeAISummary(nodeType, summary);
+      }
+    }
+  }
+
+  /**
+   * Resolve the node names for an npm-only package.
+   *
+   * The package.json `n8n.nodes` array lists the package's node entry points
+   * (e.g. "dist/nodes/GlobalConstants/GlobalConstants.node.js"), which carry the
+   * real node names. Deriving them from the package name instead fabricated node
+   * types that do not exist in n8n (#949); using only the first entry hid every
+   * other node a package ships (#967).
+   */
+  private async resolveNpmNodeNames(
+    packageName: string,
+    version?: string
+  ): Promise<ResolvedNpmNodeNames> {
+    let packageJson: any = null;
+
+    try {
+      packageJson = await this.fetcher.fetchPackageJson(packageName, version, NPM_MANIFEST_FETCH);
+    } catch (error: any) {
+      logger.warn(`Could not fetch package.json for ${packageName}: ${error.message}`);
+    }
+
+    const fallback = this.extractNodeNameFromPackage(packageName);
+
+    // fetchPackageJson resolves to null once every attempt failed, so a registry
+    // miss is not always a thrown error.
+    if (!packageJson) {
+      logger.warn(
+        `Could not read package.json for ${packageName}, falling back to the package-name heuristic: "${fallback}"`
+      );
+      return { names: [fallback], source: 'unavailable' };
+    }
+
+    const entries: unknown[] = Array.isArray(packageJson?.n8n?.nodes) ? packageJson.n8n.nodes : [];
+    const nodeNames = new Set<string>();
+    for (const entry of entries) {
+      const nodeName = typeof entry === 'string' ? extractNodeNameFromEntryPath(entry) : undefined;
+      if (nodeName) {
+        nodeNames.add(nodeName);
+      }
+    }
+
+    if (nodeNames.size > 0) {
+      const names = [...nodeNames];
+      if (names.length > MAX_NODES_PER_PACKAGE) {
+        logger.warn(
+          `${packageName} declares ${names.length} nodes, storing the first ${MAX_NODES_PER_PACKAGE}`
+        );
+        names.length = MAX_NODES_PER_PACKAGE;
+      }
+      return { names, source: 'manifest' };
+    }
+
+    logger.warn(
+      `No usable n8n.nodes entry for ${packageName}, falling back to the package-name heuristic: "${fallback}"`
+    );
+    return { names: [fallback], source: 'fallback' };
   }
 
   /**
@@ -362,6 +635,7 @@ export class CommunityNodeService {
    *
    * Note: We use lowercase because most community nodes follow this convention.
    * Verified nodes from Strapi have the correct casing in nodeDesc.name.
+   * Only a fallback — see resolveNpmNodeNames.
    */
   private extractNodeNameFromPackage(packageName: string): string {
     // Remove scope if present

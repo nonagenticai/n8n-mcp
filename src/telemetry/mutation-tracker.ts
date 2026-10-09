@@ -40,9 +40,27 @@ export class MutationTracker {
         return null;
       }
 
-      // Sanitize workflows to remove credentials and sensitive data
+      // Sanitize workflows to remove credentials and sensitive data. The before
+      // snapshot never leaves this method — it drives deduplication and the
+      // before-hashes, which are computed over the sanitized form so they stay
+      // comparable with previously recorded mutations.
       const workflowBefore = WorkflowSanitizer.sanitizeWorkflowRaw(data.workflowBefore);
       const workflowAfter = WorkflowSanitizer.sanitizeWorkflowRaw(data.workflowAfter);
+
+      // SECURITY (GHSA-8g7g-hmwm-6rv2): redact caller-supplied operations,
+      // validation results, and error messages before storing in the telemetry record.
+      const sanitizedOperations = WorkflowSanitizer.sanitizeTelemetryObject<DiffOperation[]>(
+        data.operations
+      );
+      const sanitizedValidationBefore = WorkflowSanitizer.sanitizeTelemetryObject(
+        data.validationBefore
+      );
+      const sanitizedValidationAfter = WorkflowSanitizer.sanitizeTelemetryObject(
+        data.validationAfter
+      );
+      const sanitizedMutationError = WorkflowSanitizer.sanitizeTelemetryObject<string | undefined>(
+        data.mutationError
+      );
 
       // Sanitize user intent
       const sanitizedIntent = intentSanitizer.sanitize(data.userIntent);
@@ -88,7 +106,6 @@ export class MutationTracker {
       const record: WorkflowMutationRecord = {
         userId,
         sessionId: data.sessionId,
-        workflowBefore,
         workflowAfter,
         workflowHashBefore: hashBefore,
         workflowHashAfter: hashAfter,
@@ -97,15 +114,15 @@ export class MutationTracker {
         userIntent: sanitizedIntent,
         intentClassification,
         toolName: data.toolName,
-        operations: data.operations,
+        operations: sanitizedOperations,
         operationCount: data.operations.length,
         operationTypes: this.extractOperationTypes(data.operations),
-        validationBefore: data.validationBefore,
-        validationAfter: data.validationAfter,
+        validationBefore: sanitizedValidationBefore,
+        validationAfter: sanitizedValidationAfter,
         ...validationMetrics,
         ...changeMetrics,
         mutationSuccess: data.mutationSuccess,
-        mutationError: data.mutationError,
+        mutationError: sanitizedMutationError,
         durationMs: data.durationMs,
       };
 
@@ -186,6 +203,12 @@ export class MutationTracker {
           if ('settings' in op && op.settings) {
             metrics.propertiesChanged += Object.keys(op.settings as any).length;
           }
+          break;
+        case 'setNodeGroups':
+          // One property change per group, so an ungroup-all still registers as a change
+          metrics.propertiesChanged += Array.isArray((op as any).nodeGroups)
+            ? Math.max((op as any).nodeGroups.length, 1)
+            : 1;
           break;
         case 'moveNode':
         case 'enableNode':

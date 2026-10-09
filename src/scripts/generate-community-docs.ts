@@ -11,6 +11,7 @@
  * Environment variables:
  *   N8N_MCP_LLM_BASE_URL  - LLM server URL (default: http://localhost:1234/v1)
  *   N8N_MCP_LLM_MODEL     - LLM model name (default: local-llm)
+ *   N8N_MCP_LLM_API_KEY   - LLM API key (falls back to OPENAI_API_KEY; default: 'not-needed')
  *   N8N_MCP_LLM_TIMEOUT   - Request timeout in ms (default: 60000)
  *   N8N_MCP_DB_PATH       - Database path (default: ./data/nodes.db)
  */
@@ -81,6 +82,7 @@ Options:
 Environment Variables:
   N8N_MCP_LLM_BASE_URL    LLM server URL (default: http://localhost:1234/v1)
   N8N_MCP_LLM_MODEL       LLM model name (default: local-llm)
+  N8N_MCP_LLM_API_KEY     LLM API key (falls back to OPENAI_API_KEY; default: 'not-needed')
   N8N_MCP_LLM_TIMEOUT     Request timeout in ms (default: 60000)
   N8N_MCP_DB_PATH         Database path (default: ./data/nodes.db)
 

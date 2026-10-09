@@ -23,26 +23,396 @@ import {
   RewireConnectionOperation,
   UpdateSettingsOperation,
   UpdateNameOperation,
+  SetNodeGroupsOperation,
   AddTagOperation,
   RemoveTagOperation,
   ActivateWorkflowOperation,
   DeactivateWorkflowOperation,
   CleanStaleConnectionsOperation,
-  ReplaceConnectionsOperation
+  ReplaceConnectionsOperation,
+  TransferWorkflowOperation,
+  MoveToFolderOperation,
+  PatchNodeFieldOperation
 } from '../types/workflow-diff';
-import { Workflow, WorkflowNode, WorkflowConnection } from '../types/n8n-api';
+import { Workflow, WorkflowNode, WorkflowConnection, WorkflowNodeGroup } from '../types/n8n-api';
 import { Logger } from '../utils/logger';
-import { validateWorkflowNode, validateWorkflowConnections } from './n8n-validation';
+import { GROUP_DESCRIPTION_MAX_LENGTH, repairNodeGroups, toWorkflowNodeGroup } from './node-groups';
 import { sanitizeNode, sanitizeWorkflowNodes } from './node-sanitizer';
 import { isActivatableTrigger } from '../utils/node-type-utils';
 
 const logger = new Logger({ prefix: '[WorkflowDiffEngine]' });
 
+// Safety limits for patchNodeField operations
+const PATCH_LIMITS = {
+  MAX_PATCHES: 50,           // Max patches per operation
+  MAX_REGEX_LENGTH: 500,     // Max regex pattern length (chars)
+  MAX_FIELD_SIZE_REGEX: 512 * 1024, // Max field size for regex operations (512KB)
+};
+
+// Keys that must never appear in property paths (prototype pollution prevention)
+const DANGEROUS_PATH_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+/**
+ * Check if a regex pattern contains constructs known to cause catastrophic backtracking.
+ * Detects nested quantifiers like (a+)+, (a*)+, (a+)*, (a|b+)+ etc.
+ */
+function isUnsafeRegex(pattern: string): boolean {
+  // Detect nested quantifiers: a quantifier applied to a group that itself contains a quantifier
+  // Examples: (a+)+, (a+)*, (.*)+, (\w+)*, (a|b+)+
+  // This catches the most common ReDoS patterns
+  const nestedQuantifier = /\([^)]*[+*][^)]*\)[+*{]/;
+  if (nestedQuantifier.test(pattern)) return true;
+
+  // Detect overlapping alternations with quantifiers: (a|a)+, (\w|\d)+
+  const overlappingAlternation = /\([^)]*\|[^)]*\)[+*{]/;
+  // Only flag if alternation branches share characters (heuristic: both contain \w, ., or same literal)
+  if (overlappingAlternation.test(pattern)) {
+    const match = pattern.match(/\(([^)]*)\|([^)]*)\)[+*{]/);
+    if (match) {
+      const [, left, right] = match;
+      // Flag if both branches use broad character classes
+      const broadClasses = ['.', '\\w', '\\d', '\\s', '\\S', '\\W', '\\D', '[^'];
+      const leftHasBroad = broadClasses.some(c => left.includes(c));
+      const rightHasBroad = broadClasses.some(c => right.includes(c));
+      if (leftHasBroad && rightHasBroad) return true;
+    }
+  }
+
+  return false;
+}
+
+interface PathSegment {
+  key: string;
+  /** Segment came from bracket syntax (`items[0]`), which only an array can satisfy. */
+  bracket: boolean;
+}
+
+/**
+ * Split a property path into segments, understanding dot notation and bracket
+ * indices: "assignments[0].value" → ["assignments", "0", "value"].
+ *
+ * Bracket indices must be non-negative integers. Anything else is malformed and
+ * throws — treating "assignments[0]" as a literal key silently wrote a junk
+ * sibling property instead of updating the array element (#950).
+ */
+function parsePropertyPath(path: string): PathSegment[] {
+  const segments: PathSegment[] = [];
+
+  for (const part of path.split('.')) {
+    if (!part.includes('[') && !part.includes(']')) {
+      if (part === '') {
+        throw new Error(
+          `Invalid property path "${path}": empty path segment. ` +
+          `Write "parameters.url" without leading, trailing or repeated dots.`
+        );
+      }
+      segments.push({ key: part, bracket: false });
+      continue;
+    }
+
+    const match = /^([^[\]]*)((?:\[\d+\])+)$/.exec(part);
+    if (!match) {
+      throw new Error(
+        `Invalid property path "${path}": malformed bracket index in "${part}". ` +
+        `Use "items[0].name" with a non-negative integer, or the equivalent "items.0.name".`
+      );
+    }
+
+    const [, base, indices] = match;
+    if (base) segments.push({ key: base, bracket: false });
+    for (const [, index] of indices.matchAll(/\[(\d+)\]/g)) {
+      segments.push({ key: index, bracket: true });
+    }
+  }
+
+  return segments;
+}
+
+/**
+ * Resolve a path segment against its container, returning the key to read or
+ * write. Numeric segments address array elements by index; a bracket segment
+ * that does not land on an array is a caller mistake, not a new property.
+ *
+ * Writes additionally refuse non-index segments on arrays: keys like "-1" or
+ * "length" would either be dropped on serialization or truncate the array,
+ * which is the same silent corruption bracket parsing fixes (#950). Reads stay
+ * permissive so an unresolvable path simply reads as undefined.
+ */
+function resolveSegment(
+  container: any,
+  segment: PathSegment,
+  path: string,
+  forWrite: boolean
+): string | number {
+  if (Array.isArray(container)) {
+    if (/^\d+$/.test(segment.key)) {
+      const index = Number(segment.key);
+      if (index >= container.length) {
+        throw new Error(
+          `Invalid property path "${path}": index ${index} is out of range for an array of ${container.length} item(s).`
+        );
+      }
+      return index;
+    }
+
+    if (forWrite) {
+      throw new Error(
+        `Invalid property path "${path}": "${segment.key}" is not an array index. ` +
+        `Address array elements by position, e.g. "items[0].name".`
+      );
+    }
+  }
+
+  if (segment.bracket) {
+    throw new Error(
+      `Invalid property path "${path}": "[${segment.key}]" expects an array but found ${container === null ? 'null' : typeof container}.`
+    );
+  }
+
+  return segment.key;
+}
+
+function countOccurrences(str: string, search: string): number {
+  let count = 0;
+  let pos = 0;
+  while ((pos = str.indexOf(search, pos)) !== -1) {
+    count++;
+    pos += search.length;
+  }
+  return count;
+}
+
+/** Names the type of a rejected value for an error message: "a string", "null", "an array". */
+function describeValueType(value: unknown): string {
+  if (value === null) return 'null';
+  if (value === undefined) return 'nothing';
+  if (Array.isArray(value)) return 'an array';
+  return typeof value === 'object' ? 'an object' : `a ${typeof value}`;
+}
+
+/** The connections at one output index, or null when nothing is wired to that output (#1096). */
+type ConnectionBranch = WorkflowConnection[string][string][number];
+
+/**
+ * Read a branch's connections. A null branch is legal n8n data that any workflow read back can
+ * carry (#1096), so the walks below go through this to stay off `null.some` and `null.length` -
+ * which surfaced as an internal error rather than a diff-engine message.
+ */
+function branchConnections(branch: unknown): any[] {
+  return Array.isArray(branch) ? branch : [];
+}
+
+/**
+ * Filter a branch's connections, leaving a null branch exactly as it arrived: rewriting it to
+ * `[]` would edit an output the operation was never asked to touch.
+ */
+function filterBranch(
+  branch: ConnectionBranch,
+  keep: (conn: NonNullable<ConnectionBranch>[number]) => boolean
+): ConnectionBranch {
+  return Array.isArray(branch) ? branch.filter(keep) : branch;
+}
+
+/**
+ * Drop the trailing branches with nothing wired to them. Intermediate ones stay: a branch's
+ * position in the array is its output index, so dropping one rewires every output after it.
+ */
+function trimTrailingEmptyBranches(branches: ConnectionBranch[]): void {
+  while (branches.length > 0 && branchConnections(branches[branches.length - 1]).length === 0) {
+    branches.pop();
+  }
+}
+
+/**
+ * The addNode payload arrives as `z.any()` - the request schema cannot type it, because the
+ * operation's contract is looser than n8n's node schema (applyAddNode fills in `id`,
+ * `typeVersion` and `parameters`). Check the two fields the validator and the appliers
+ * dereference, so a malformed payload becomes an operation error instead of a TypeError (#1092).
+ */
+function validateAddNodeShape(node: unknown): string | null {
+  if (node === null || typeof node !== 'object' || Array.isArray(node)) {
+    return `addNode requires a node object, received ${describeValueType(node)}`;
+  }
+
+  const candidate = node as Record<string, unknown>;
+
+  if (typeof candidate.name !== 'string') {
+    return `addNode requires a string "name" on the node, received ${describeValueType(candidate.name)}`;
+  }
+
+  if (typeof candidate.type !== 'string') {
+    return `addNode requires a string "type" on the node, received ${describeValueType(candidate.type)}`;
+  }
+
+  // `position` is deliberately NOT required here even though applyAddNode does not default
+  // it: a batch may legitimately add a node and place it with a later moveNode operation.
+  // The post-apply structure check is where a position that never arrives is reported.
+  return null;
+}
+
+// Fields that hold plain JavaScript: the Code node's jsCode and the legacy
+// Function/FunctionItem nodes' functionCode. Python lives in pythonCode.
+const JS_CODE_FIELD_NAMES = new Set(['jsCode', 'functionCode']);
+
+// Parses (never executes) code as an async function body, matching n8n's own
+// wrapping of Code-node JS — so top-level return/await are valid.
+const AsyncFunctionCtor = (async () => {}).constructor as new (...args: string[]) => unknown;
+
+// Parsing is synchronous on the event loop; a 60 MiB body costs ~1s. Real
+// Code-node sources are kilobytes — beyond this the code is never parsed,
+// so oversized input cannot become a DoS lever (Codex review on #1014).
+const MAX_SYNTAX_CHECKED_LENGTH = 1_000_000;
+
+type JsSyntaxCheck =
+  | { status: 'valid' }
+  | { status: 'invalid'; message: string }
+  // Could not judge the code either way: oversized, or the parser gave up
+  // with a non-SyntaxError (a CSP EvalError, a RangeError from pathological
+  // nesting). Distinct from 'valid' so a checkably-valid field cannot be
+  // patched into an unverifiable blob unnoticed (Codex review on #1014).
+  | { status: 'uncheckable'; reason: string };
+
+function checkJsSyntax(code: string): JsSyntaxCheck {
+  if (code.length > MAX_SYNTAX_CHECKED_LENGTH) {
+    return { status: 'uncheckable', reason: `code exceeds ${MAX_SYNTAX_CHECKED_LENGTH} characters` };
+  }
+  try {
+    new AsyncFunctionCtor(code);
+    return { status: 'valid' };
+  } catch (error) {
+    if (error instanceof SyntaxError) return { status: 'invalid', message: error.message };
+    return { status: 'uncheckable', reason: `the parser gave up (${error instanceof Error ? error.name : 'unknown error'})` };
+  }
+}
+
+// jsCode/functionCode are noDataExpression fields: n8n strips one leading "="
+// before executing them (node-helpers), so an "=" value is NOT an expression
+// there — parse what will actually run (Codex review on #1014).
+function stripExpressionPrefix(value: string): string {
+  return value.startsWith('=') ? value.slice(1) : value;
+}
+
+/**
+ * After a find/replace patch lands on a JavaScript code field, parse the result
+ * so a patch that leaves broken code fails the operation instead of saving it
+ * (#1012 expansion). Throws before the caller writes, keeping the operation
+ * atomic. Only regressions the patch introduced are blocked: when the field
+ * was already unparseable before patching, an incremental repair must be able
+ * to pass through still-broken states.
+ */
+function assertPatchedJsSyntax(operation: string, fieldPath: string, patched: string, original: string): void {
+  const fieldName = fieldPath.split('.').pop() ?? '';
+  if (!JS_CODE_FIELD_NAMES.has(fieldName)) return;
+
+  const patchedCheck = checkJsSyntax(stripExpressionPrefix(patched));
+  if (patchedCheck.status === 'valid') return;
+
+  // The gate: judge only against a baseline we could actually judge. A field
+  // that was already invalid stays patchable (incremental repair), and an
+  // uncheckable baseline gives no standard to hold the patch to.
+  if (checkJsSyntax(stripExpressionPrefix(original)).status !== 'valid') return;
+
+  if (patchedCheck.status === 'invalid') {
+    throw new Error(
+      `${operation}: patches would leave "${fieldPath}" with invalid JavaScript (${patchedCheck.message}). ` +
+      `The workflow was not modified. If several dependent edits pass through an invalid intermediate state, ` +
+      `apply them as one operation — only the final result of the patches array is checked.`
+    );
+  }
+
+  throw new Error(
+    `${operation}: could not verify the JavaScript syntax of "${fieldPath}" after patching (${patchedCheck.reason}). ` +
+    `The workflow was not modified. To set the field anyway, replace its full value with an updateNode operation, ` +
+    `which is not syntax-checked.`
+  );
+}
+
+function operationReferencesAddedNode(
+  operation: WorkflowDiffOperation,
+  addedNode: AddNodeOperation['node']
+): boolean {
+  // `node` arrives as z.any() and is not shape-checked until validateAddNode, which runs
+  // after this reordering pass. A malformed payload must not throw here: it carries no
+  // usable name or id, so no operation can reference it, and validateAddNode still reports
+  // it against its own operation index rather than as a diff-engine error (#1092).
+  if (!addedNode || typeof addedNode !== 'object') {
+    return false;
+  }
+
+  if (operation.type === 'addConnection') {
+    return operation.source === addedNode.name
+      || operation.source === addedNode.id
+      || operation.target === addedNode.name
+      || operation.target === addedNode.id;
+  }
+
+  if (operation.type === 'rewireConnection') {
+    return operation.source === addedNode.name
+      || operation.source === addedNode.id
+      || operation.from === addedNode.name
+      || operation.from === addedNode.id
+      || operation.to === addedNode.name
+      || operation.to === addedNode.id;
+  }
+
+  return false;
+}
+
+/**
+ * Build execution order for diff operations.
+ *
+ * Operations execute in the order the caller provided so each one validates
+ * against the workflow state at its position in the sequence (#788). The only
+ * exception is the legacy "add node and connect it in the same batch" pattern,
+ * where an addConnection / rewireConnection references a node added later in
+ * the batch — we hoist that addNode to just before its first earlier reference
+ * so the connection op still resolves. Other operation kinds are never
+ * reordered; if a caller emits `removeConnection X→Y` before `addNode X`,
+ * it now fails as it should.
+ */
+function buildExecutionEntries(operations: WorkflowDiffOperation[]) {
+  const entries = operations.map((operation, index) => ({ operation, index }));
+
+  for (let currentIndex = 0; currentIndex < entries.length; currentIndex++) {
+    const entry = entries[currentIndex];
+    if (entry.operation.type !== 'addNode') continue;
+    const addedNode = entry.operation.node;
+
+    const referencedBeforeAdd = entries.findIndex((candidate, candidateIndex) =>
+      candidateIndex < currentIndex
+      && isConnectionOperation(candidate.operation)
+      && operationReferencesAddedNode(candidate.operation, addedNode)
+    );
+
+    if (referencedBeforeAdd === -1) continue;
+
+    entries.splice(currentIndex, 1);
+    entries.splice(referencedBeforeAdd, 0, entry);
+  }
+
+  return entries;
+}
+
+/**
+ * Not safe for concurrent use — create a new instance per request.
+ * Instance state is reset at the start of each applyDiff() call.
+ */
 export class WorkflowDiffEngine {
   // Track node name changes during operations for connection reference updates
   private renameMap: Map<string, string> = new Map();
   // Track warnings during operation processing
   private warnings: WorkflowDiffValidationError[] = [];
+  // Track which nodes were added/updated so sanitization only runs on them
+  private modifiedNodeIds = new Set<string>();
+  // Track removed node names for better error messages
+  private removedNodeNames = new Set<string>();
+  // Track tag operations for dedicated API calls
+  private tagsToAdd: string[] = [];
+  private tagsToRemove: string[] = [];
+  // Track transfer operation for dedicated API call
+  private transferToProjectId: string | undefined;
+  // Canvas groups authored by this diff — the caller must not let n8n silently reject them
+  private authoredGroupNames = new Set<string>();
 
   /**
    * Apply diff operations to a workflow
@@ -55,24 +425,19 @@ export class WorkflowDiffEngine {
       // Reset tracking for this diff operation
       this.renameMap.clear();
       this.warnings = [];
+      this.modifiedNodeIds.clear();
+      this.removedNodeNames.clear();
+      this.tagsToAdd = [];
+      this.tagsToRemove = [];
+      this.transferToProjectId = undefined;
+      this.authoredGroupNames.clear();
 
       // Clone workflow to avoid modifying original
       const workflowCopy = JSON.parse(JSON.stringify(workflow));
 
-      // Group operations by type for two-pass processing
-      const nodeOperationTypes = ['addNode', 'removeNode', 'updateNode', 'moveNode', 'enableNode', 'disableNode'];
-      const nodeOperations: Array<{ operation: WorkflowDiffOperation; index: number }> = [];
-      const otherOperations: Array<{ operation: WorkflowDiffOperation; index: number }> = [];
-
-      request.operations.forEach((operation, index) => {
-        if (nodeOperationTypes.includes(operation.type)) {
-          nodeOperations.push({ operation, index });
-        } else {
-          otherOperations.push({ operation, index });
-        }
-      });
-
-      const allOperations = [...nodeOperations, ...otherOperations];
+      const operationEntries = buildExecutionEntries(request.operations);
+      const nodeOperationCount = request.operations.filter(isNodeOperation).length;
+      const otherOperationCount = request.operations.length - nodeOperationCount;
       const errors: WorkflowDiffValidationError[] = [];
       const appliedIndices: number[] = [];
       const failedIndices: number[] = [];
@@ -80,7 +445,7 @@ export class WorkflowDiffEngine {
       // Process based on mode
       if (request.continueOnError) {
         // Best-effort mode: continue even if some operations fail
-        for (const { operation, index } of allOperations) {
+        for (const { operation, index } of operationEntries) {
           const error = this.validateOperation(workflowCopy, operation);
           if (error) {
             errors.push({
@@ -94,6 +459,7 @@ export class WorkflowDiffEngine {
 
           try {
             this.applyOperation(workflowCopy, operation);
+            this.flushPendingRenames(workflowCopy);
             appliedIndices.push(index);
           } catch (error) {
             const errorMsg = `Failed to apply operation: ${error instanceof Error ? error.message : 'Unknown error'}`;
@@ -106,25 +472,31 @@ export class WorkflowDiffEngine {
           }
         }
 
-        // Update connection references after all node renames (even in continueOnError mode)
-        if (this.renameMap.size > 0 && appliedIndices.length > 0) {
-          this.updateConnectionReferences(workflowCopy);
-          logger.debug(`Auto-updated ${this.renameMap.size} node name references in connections (continueOnError mode)`);
-        }
+        this.finalizeNodeGroups(workflowCopy);
 
-        // If validateOnly flag is set, return success without applying
+        // If validateOnly flag is set, return success without applying.
+        // Include workflowCopy so the caller can run structural validation against
+        // the simulated post-diff result (#744).
         if (request.validateOnly) {
           return {
             success: errors.length === 0,
+            workflow: workflowCopy,
             message: errors.length === 0
               ? 'Validation successful. All operations are valid.'
               : `Validation completed with ${errors.length} errors.`,
             errors: errors.length > 0 ? errors : undefined,
             warnings: this.warnings.length > 0 ? this.warnings : undefined,
             applied: appliedIndices,
-            failed: failedIndices
+            failed: failedIndices,
+            authoredGroupNames: this.authoredGroupNamesOrUndefined()
           };
         }
+
+        // Extract and clean up activation flags (same as atomic mode)
+        const shouldActivate = (workflowCopy as any)._shouldActivate === true;
+        const shouldDeactivate = (workflowCopy as any)._shouldDeactivate === true;
+        delete (workflowCopy as any)._shouldActivate;
+        delete (workflowCopy as any)._shouldDeactivate;
 
         const success = appliedIndices.length > 0;
         return {
@@ -135,12 +507,17 @@ export class WorkflowDiffEngine {
           errors: errors.length > 0 ? errors : undefined,
           warnings: this.warnings.length > 0 ? this.warnings : undefined,
           applied: appliedIndices,
-          failed: failedIndices
+          failed: failedIndices,
+          shouldActivate: shouldActivate || undefined,
+          shouldDeactivate: shouldDeactivate || undefined,
+          tagsToAdd: this.tagsToAdd.length > 0 ? this.tagsToAdd : undefined,
+          tagsToRemove: this.tagsToRemove.length > 0 ? this.tagsToRemove : undefined,
+          transferToProjectId: this.transferToProjectId || undefined,
+          authoredGroupNames: this.authoredGroupNamesOrUndefined()
         };
       } else {
         // Atomic mode: all operations must succeed
-        // Pass 1: Validate and apply node operations first
-        for (const { operation, index } of nodeOperations) {
+        for (const { operation, index } of operationEntries) {
           const error = this.validateOperation(workflowCopy, operation);
           if (error) {
             return {
@@ -155,6 +532,7 @@ export class WorkflowDiffEngine {
 
           try {
             this.applyOperation(workflowCopy, operation);
+            this.flushPendingRenames(workflowCopy);
           } catch (error) {
             return {
               success: false,
@@ -167,52 +545,30 @@ export class WorkflowDiffEngine {
           }
         }
 
-        // Update connection references after all node renames
-        if (this.renameMap.size > 0) {
-          this.updateConnectionReferences(workflowCopy);
-          logger.debug(`Auto-updated ${this.renameMap.size} node name references in connections`);
+        // Sanitize only modified nodes to avoid breaking unrelated nodes (#592)
+        if (this.modifiedNodeIds.size > 0) {
+          workflowCopy.nodes = workflowCopy.nodes.map((node: WorkflowNode) => {
+            if (this.modifiedNodeIds.has(node.id)) {
+              return sanitizeNode(node);
+            }
+            return node;
+          });
+          logger.debug(`Sanitized ${this.modifiedNodeIds.size} modified nodes`);
         }
 
-        // Pass 2: Validate and apply other operations (connections, metadata)
-        for (const { operation, index } of otherOperations) {
-          const error = this.validateOperation(workflowCopy, operation);
-          if (error) {
-            return {
-              success: false,
-              errors: [{
-                operation: index,
-                message: error,
-                details: operation
-              }]
-            };
-          }
+        this.finalizeNodeGroups(workflowCopy);
 
-          try {
-            this.applyOperation(workflowCopy, operation);
-          } catch (error) {
-            return {
-              success: false,
-              errors: [{
-                operation: index,
-                message: `Failed to apply operation: ${error instanceof Error ? error.message : 'Unknown error'}`,
-                details: operation
-              }]
-            };
-          }
-        }
-
-        // Sanitize ALL nodes in the workflow after operations are applied
-        // This ensures existing invalid nodes (e.g., binary operators with singleValue: true)
-        // are fixed automatically when any update is made to the workflow
-        workflowCopy.nodes = workflowCopy.nodes.map((node: WorkflowNode) => sanitizeNode(node));
-
-        logger.debug('Applied full-workflow sanitization to all nodes');
-
-        // If validateOnly flag is set, return success without applying
+        // If validateOnly flag is set, return success without applying.
+        // Include the post-diff workflowCopy so the caller (handlers-workflow-diff)
+        // can run structural validation against the simulated result — without it
+        // both validate and apply paths cannot agree on validity (#744).
         if (request.validateOnly) {
           return {
             success: true,
-            message: 'Validation successful. Operations are valid but not applied.'
+            workflow: workflowCopy,
+            message: 'Validation successful. Operations are valid but not applied.',
+            warnings: this.warnings.length > 0 ? this.warnings : undefined,
+            authoredGroupNames: this.authoredGroupNamesOrUndefined()
           };
         }
 
@@ -230,10 +586,14 @@ export class WorkflowDiffEngine {
           success: true,
           workflow: workflowCopy,
           operationsApplied,
-          message: `Successfully applied ${operationsApplied} operations (${nodeOperations.length} node ops, ${otherOperations.length} other ops)`,
+          message: `Successfully applied ${operationsApplied} operations (${nodeOperationCount} node ops, ${otherOperationCount} other ops)`,
           warnings: this.warnings.length > 0 ? this.warnings : undefined,
           shouldActivate: shouldActivate || undefined,
-          shouldDeactivate: shouldDeactivate || undefined
+          shouldDeactivate: shouldDeactivate || undefined,
+          tagsToAdd: this.tagsToAdd.length > 0 ? this.tagsToAdd : undefined,
+          tagsToRemove: this.tagsToRemove.length > 0 ? this.tagsToRemove : undefined,
+          transferToProjectId: this.transferToProjectId || undefined,
+          authoredGroupNames: this.authoredGroupNamesOrUndefined()
         };
       }
     } catch (error) {
@@ -248,7 +608,6 @@ export class WorkflowDiffEngine {
     }
   }
 
-
   /**
    * Validate a single operation
    */
@@ -260,6 +619,8 @@ export class WorkflowDiffEngine {
         return this.validateRemoveNode(workflow, operation);
       case 'updateNode':
         return this.validateUpdateNode(workflow, operation);
+      case 'patchNodeField':
+        return this.validatePatchNodeField(workflow, operation as PatchNodeFieldOperation);
       case 'moveNode':
         return this.validateMoveNode(workflow, operation);
       case 'enableNode':
@@ -276,6 +637,12 @@ export class WorkflowDiffEngine {
       case 'addTag':
       case 'removeTag':
         return null; // These are always valid
+      case 'setNodeGroups':
+        return this.validateSetNodeGroups(workflow, operation as SetNodeGroupsOperation);
+      case 'transferWorkflow':
+        return this.validateTransferWorkflow(workflow, operation as TransferWorkflowOperation);
+      case 'moveToFolder':
+        return this.validateMoveToFolder(workflow, operation as MoveToFolderOperation);
       case 'activateWorkflow':
         return this.validateActivateWorkflow(workflow, operation);
       case 'deactivateWorkflow':
@@ -303,6 +670,9 @@ export class WorkflowDiffEngine {
       case 'updateNode':
         this.applyUpdateNode(workflow, operation);
         break;
+      case 'patchNodeField':
+        this.applyPatchNodeField(workflow, operation as PatchNodeFieldOperation);
+        break;
       case 'moveNode':
         this.applyMoveNode(workflow, operation);
         break;
@@ -327,6 +697,9 @@ export class WorkflowDiffEngine {
       case 'updateName':
         this.applyUpdateName(workflow, operation);
         break;
+      case 'setNodeGroups':
+        this.applySetNodeGroups(workflow, operation as SetNodeGroupsOperation);
+        break;
       case 'addTag':
         this.applyAddTag(workflow, operation);
         break;
@@ -345,12 +718,23 @@ export class WorkflowDiffEngine {
       case 'replaceConnections':
         this.applyReplaceConnections(workflow, operation);
         break;
+      case 'transferWorkflow':
+        this.applyTransferWorkflow(workflow, operation as TransferWorkflowOperation);
+        break;
+      case 'moveToFolder':
+        this.applyMoveToFolder(workflow, operation as MoveToFolderOperation);
+        break;
     }
   }
 
   // Node operation validators
   private validateAddNode(workflow: Workflow, operation: AddNodeOperation): string | null {
     const { node } = operation;
+
+    const shapeError = validateAddNodeShape(node);
+    if (shapeError) {
+      return shapeError;
+    }
 
     // Check if node with same name already exists (use normalization to prevent collisions)
     const normalizedNewName = this.normalizeNodeName(node.name);
@@ -383,7 +767,7 @@ export class WorkflowDiffEngine {
     const hasConnections = Object.values(workflow.connections).some(conn => {
       return Object.values(conn).some(outputs => 
         outputs.some(connections => 
-          connections.some(c => c.node === node.name)
+          branchConnections(connections).some(c => c.node === node.name)
         )
       );
     });
@@ -405,12 +789,28 @@ export class WorkflowDiffEngine {
 
     // Check for missing required parameter
     if (!operation.updates) {
-      return `Missing required parameter 'updates'. The updateNode operation requires an 'updates' object containing properties to modify. Example: {type: "updateNode", nodeId: "abc", updates: {name: "New Name"}}`;
+      return `Missing required parameter 'updates'. The updateNode operation requires an 'updates' object. Correct structure: {type: "updateNode", nodeId: "abc-123" OR nodeName: "My Node", updates: {name: "New Name", "parameters.url": "https://example.com"}}`;
+    }
+
+    // `updates` is z.any() on the wire, and everything below treats it as a record - the
+    // `in` operator a few lines down throws on a primitive (#1092).
+    if (typeof operation.updates !== 'object' || Array.isArray(operation.updates)) {
+      return `The updateNode operation requires 'updates' to be an object of field paths, received ${describeValueType(operation.updates)}. Example: {type: "updateNode", nodeName: "My Node", updates: {"parameters.url": "https://example.com"}}`;
     }
 
     const node = this.findNode(workflow, operation.nodeId, operation.nodeName);
     if (!node) {
       return this.formatNodeNotFoundError(workflow, operation.nodeId || operation.nodeName || '', 'updateNode');
+    }
+
+    // Node IDs are referenced by canvas groups (and n8n's own pinned data), so a rewrite here
+    // would silently orphan them. Renaming is fine; re-identifying is not.
+    if ('id' in operation.updates && operation.updates.id !== node.id) {
+      return `Cannot change the id of node "${node.name}": node IDs are immutable because canvas groups and pinned data reference them. Remove and re-add the node instead.`;
+    }
+
+    if ('name' in operation.updates && typeof operation.updates.name !== 'string') {
+      return `Cannot rename node "${node.name}": 'updates.name' must be a string, received ${describeValueType(operation.updates.name)}.`;
     }
 
     // Check for name collision if renaming
@@ -429,14 +829,152 @@ export class WorkflowDiffEngine {
       }
     }
 
+    for (const [path, value] of Object.entries(operation.updates)) {
+      try {
+        parsePropertyPath(path);
+      } catch (error) {
+        return error instanceof Error ? error.message : `Invalid property path "${path}"`;
+      }
+
+      // Validate __patch_find_replace syntax (#642)
+      if (value !== null && typeof value === 'object' && !Array.isArray(value)
+          && '__patch_find_replace' in value) {
+        const patches = value.__patch_find_replace;
+        if (!Array.isArray(patches)) {
+          return `Invalid __patch_find_replace at "${path}": must be an array of {find, replace} objects`;
+        }
+        for (let i = 0; i < patches.length; i++) {
+          const patch = patches[i];
+          if (!patch || typeof patch.find !== 'string' || typeof patch.replace !== 'string') {
+            return `Invalid __patch_find_replace entry at "${path}[${i}]": each entry must have "find" (string) and "replace" (string)`;
+          }
+        }
+        // node was already found above — reuse it
+        const currentValue = this.getNestedProperty(node, path);
+        if (currentValue === undefined) {
+          return `Cannot apply __patch_find_replace to "${path}": property does not exist on node`;
+        }
+        if (typeof currentValue !== 'string') {
+          return `Cannot apply __patch_find_replace to "${path}": current value is ${typeof currentValue}, expected string`;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private validatePatchNodeField(workflow: Workflow, operation: PatchNodeFieldOperation): string | null {
+    if (!operation.nodeId && !operation.nodeName) {
+      return `patchNodeField requires either "nodeId" or "nodeName"`;
+    }
+
+    if (!operation.fieldPath || typeof operation.fieldPath !== 'string') {
+      return `patchNodeField requires a "fieldPath" string (e.g., "parameters.jsCode")`;
+    }
+
+    let pathSegments: PathSegment[];
+    try {
+      pathSegments = parsePropertyPath(operation.fieldPath);
+    } catch (error) {
+      const reason = error instanceof Error
+        ? error.message
+        : `invalid fieldPath "${operation.fieldPath}"`;
+      return `patchNodeField: ${reason}`;
+    }
+
+    // Prototype pollution protection
+    if (pathSegments.some(s => DANGEROUS_PATH_KEYS.has(s.key))) {
+      return `patchNodeField: fieldPath "${operation.fieldPath}" contains a forbidden key (__proto__, constructor, or prototype)`;
+    }
+
+    // Same reason updateNode refuses it: canvas groups and pinned data reference the node id, so
+    // rewriting it here would orphan them. Only the node's OWN id is protected — a nested id such
+    // as `parameters.assignments.assignments[0].id` is ordinary node data.
+    if (pathSegments[0].key === 'id') {
+      return `Cannot patch the id of a node: node IDs are immutable because canvas groups and pinned data reference them. Remove and re-add the node instead.`;
+    }
+
+    if (!Array.isArray(operation.patches) || operation.patches.length === 0) {
+      return `patchNodeField requires a non-empty "patches" array of {find, replace} objects`;
+    }
+
+    // Resource limit: max patches per operation
+    if (operation.patches.length > PATCH_LIMITS.MAX_PATCHES) {
+      return `patchNodeField: too many patches (${operation.patches.length}). Maximum is ${PATCH_LIMITS.MAX_PATCHES} per operation. Split into multiple operations if needed.`;
+    }
+
+    for (let i = 0; i < operation.patches.length; i++) {
+      const patch = operation.patches[i];
+      if (!patch || typeof patch.find !== 'string' || typeof patch.replace !== 'string') {
+        return `Invalid patch entry at index ${i}: each entry must have "find" (string) and "replace" (string)`;
+      }
+      if (patch.find.length === 0) {
+        return `Invalid patch entry at index ${i}: "find" must not be empty`;
+      }
+      if (patch.regex) {
+        // Resource limit: max regex pattern length
+        if (patch.find.length > PATCH_LIMITS.MAX_REGEX_LENGTH) {
+          return `Regex pattern at patch index ${i} is too long (${patch.find.length} chars). Maximum is ${PATCH_LIMITS.MAX_REGEX_LENGTH} characters.`;
+        }
+        try {
+          new RegExp(patch.find);
+        } catch (e) {
+          return `Invalid regex pattern at patch index ${i}: ${e instanceof Error ? e.message : 'invalid regex'}`;
+        }
+        // ReDoS protection: reject patterns with nested quantifiers
+        if (isUnsafeRegex(patch.find)) {
+          return `Potentially unsafe regex pattern at patch index ${i}: nested quantifiers or overlapping alternations can cause excessive backtracking. Simplify the pattern or use literal matching (regex: false).`;
+        }
+      }
+    }
+
+    const node = this.findNode(workflow, operation.nodeId, operation.nodeName);
+    if (!node) {
+      return this.formatNodeNotFoundError(workflow, operation.nodeId || operation.nodeName || '', 'patchNodeField');
+    }
+
+    const currentValue = this.getNestedProperty(node, operation.fieldPath);
+    if (currentValue === undefined) {
+      return `Cannot apply patchNodeField to "${operation.fieldPath}": property does not exist on node "${node.name}"`;
+    }
+    if (typeof currentValue !== 'string') {
+      return `Cannot apply patchNodeField to "${operation.fieldPath}": current value is ${typeof currentValue}, expected string`;
+    }
+
+    // Resource limit: cap field size for regex operations
+    const hasRegex = operation.patches.some(p => p.regex);
+    if (hasRegex && typeof currentValue === 'string' && currentValue.length > PATCH_LIMITS.MAX_FIELD_SIZE_REGEX) {
+      return `Field "${operation.fieldPath}" is too large for regex operations (${Math.round(currentValue.length / 1024)}KB). Maximum is ${PATCH_LIMITS.MAX_FIELD_SIZE_REGEX / 1024}KB. Use literal matching (regex: false) for large fields.`;
+    }
+
     return null;
   }
 
   private validateMoveNode(workflow: Workflow, operation: MoveNodeOperation): string | null {
+    // Catch common parameter typos before any mutation (QA #6). Previously
+    // `newPosition` was silently accepted, position ended up undefined, and
+    // the only signal was a cryptic `position Required` from the final
+    // workflow-shape check — no mention of which op produced it. Reject
+    // even when `position` is also set, so callers don't carry a misleading
+    // alias through into their configs.
+    const operationAny = operation as any;
+    if (operationAny.newPosition !== undefined) {
+      return `Invalid parameter 'newPosition' for moveNode. Did you mean 'position'? Example: {type: "moveNode", nodeName: "My Node", position: [450, 600]}`;
+    }
+
     const node = this.findNode(workflow, operation.nodeId, operation.nodeName);
     if (!node) {
       return this.formatNodeNotFoundError(workflow, operation.nodeId || operation.nodeName || '', 'moveNode');
     }
+
+    if (!operation.position) {
+      return `Missing required parameter 'position' for moveNode. Example: {type: "moveNode", nodeName: "${node.name}", position: [450, 600]}`;
+    }
+    if (!Array.isArray(operation.position) || operation.position.length !== 2 ||
+        typeof operation.position[0] !== 'number' || typeof operation.position[1] !== 'number') {
+      return `Invalid 'position' for moveNode. Must be [x, y] with two numbers. Got: ${JSON.stringify(operation.position)}`;
+    }
+
     return null;
   }
 
@@ -485,15 +1023,18 @@ export class WorkflowDiffEngine {
       return `Target node not found: "${operation.target}". Available nodes: ${availableNodes}. Tip: Use node ID for names with special characters (apostrophes, quotes).`;
     }
 
-    // Check if connection already exists
-    const sourceOutput = operation.sourceOutput || 'main';
+    // Check if connection already exists at the specific (sourceOutput, sourceIndex) slot.
+    // Resolving smart parameters here matches applyAddConnection's behavior so a duplicate
+    // is only flagged when the resolved triple (source, sourceOutput, sourceIndex, target)
+    // matches an existing edge. Without this, a Switch/IF node that already has an edge
+    // from output 0 to target T would falsely block adding output 1 → T (#738).
+    // silent: true so warnings are emitted by the apply phase only (avoids duplicates).
+    const { sourceOutput, sourceIndex } = this.resolveSmartParameters(workflow, operation, { silent: true });
     const existing = workflow.connections[sourceNode.name]?.[sourceOutput];
     if (existing) {
-      const hasConnection = existing.some(connections =>
-        connections.some(c => c.node === targetNode.name)
-      );
-      if (hasConnection) {
-        return `Connection already exists from "${sourceNode.name}" to "${targetNode.name}"`;
+      const slot = existing[sourceIndex];
+      if (Array.isArray(slot) && slot.some(c => c.node === targetNode.name)) {
+        return `Connection already exists from "${sourceNode.name}" (output "${sourceOutput}", index ${sourceIndex}) to "${targetNode.name}"`;
       }
     }
 
@@ -510,12 +1051,18 @@ export class WorkflowDiffEngine {
     const targetNode = this.findNode(workflow, operation.target, operation.target);
 
     if (!sourceNode) {
+      if (this.removedNodeNames.has(operation.source)) {
+        return `Source node "${operation.source}" was already removed by a prior removeNode operation. Its connections were automatically cleaned up — no separate removeConnection needed.`;
+      }
       const availableNodes = workflow.nodes
         .map(n => `"${n.name}" (id: ${n.id.substring(0, 8)}...)`)
         .join(', ');
       return `Source node not found: "${operation.source}". Available nodes: ${availableNodes}. Tip: Use node ID for names with special characters.`;
     }
     if (!targetNode) {
+      if (this.removedNodeNames.has(operation.target)) {
+        return `Target node "${operation.target}" was already removed by a prior removeNode operation. Its connections were automatically cleaned up — no separate removeConnection needed.`;
+      }
       const availableNodes = workflow.nodes
         .map(n => `"${n.name}" (id: ${n.id.substring(0, 8)}...)`)
         .join(', ');
@@ -529,7 +1076,7 @@ export class WorkflowDiffEngine {
     }
 
     const hasConnection = connections.some(conns =>
-      conns.some(c => c.node === targetNode.name)
+      branchConnections(conns).some(c => c.node === targetNode.name)
     );
 
     if (!hasConnection) {
@@ -540,6 +1087,14 @@ export class WorkflowDiffEngine {
   }
 
   private validateRewireConnection(workflow: Workflow, operation: RewireConnectionOperation): string | null {
+    // Reject from === to up front. If both resolve to the same node, the
+    // apply would remove source→from and then skip the add (because "to" is
+    // already present — which is "from"), leaving source disconnected.
+    // Safer to fail the op than to silently drop the edge.
+    if (operation.from === operation.to) {
+      return `rewireConnection: "from" and "to" must refer to different nodes (got "${operation.from}" for both).`;
+    }
+
     // Validate source node exists
     const sourceNode = this.findNode(workflow, operation.source, operation.source);
     if (!sourceNode) {
@@ -567,8 +1122,9 @@ export class WorkflowDiffEngine {
       return `"To" node not found: "${operation.to}". Available nodes: ${availableNodes}. Tip: Use node ID for names with special characters.`;
     }
 
-    // Resolve smart parameters (branch, case) before validating connections
-    const { sourceOutput, sourceIndex } = this.resolveSmartParameters(workflow, operation);
+    // Resolve smart parameters (branch, case) before validating connections.
+    // silent: true so warnings are emitted by the apply phase only (avoids duplicates).
+    const { sourceOutput, sourceIndex } = this.resolveSmartParameters(workflow, operation, { silent: true });
 
     // Validate that connection from source to "from" exists at the specific index
     const connections = workflow.connections[sourceNode.name]?.[sourceOutput];
@@ -596,7 +1152,10 @@ export class WorkflowDiffEngine {
       name: operation.node.name,
       type: operation.node.type,
       typeVersion: operation.node.typeVersion || 1,
-      position: operation.node.position,
+      // Carried through as-is, including absent: a batch may place the node with a later
+      // moveNode, and a node that never receives a position is reported by the post-apply
+      // structure validation rather than defaulted to a silent [0, 0].
+      position: operation.node.position as [number, number],
       parameters: operation.node.parameters || {},
       credentials: operation.node.credentials,
       disabled: operation.node.disabled,
@@ -614,13 +1173,16 @@ export class WorkflowDiffEngine {
     // Sanitize node to ensure complete metadata (filter options, operator structure, etc.)
     const sanitizedNode = sanitizeNode(newNode);
 
+    this.modifiedNodeIds.add(sanitizedNode.id);
     workflow.nodes.push(sanitizedNode);
   }
 
   private applyRemoveNode(workflow: Workflow, operation: RemoveNodeOperation): void {
     const node = this.findNode(workflow, operation.nodeId, operation.nodeName);
     if (!node) return;
-    
+
+    this.removedNodeNames.add(node.name);
+
     // Remove node from array
     const index = workflow.nodes.findIndex(n => n.id === node.id);
     if (index !== -1) {
@@ -631,54 +1193,200 @@ export class WorkflowDiffEngine {
     delete workflow.connections[node.name];
     
     // Remove all connections to this node
-    Object.keys(workflow.connections).forEach(sourceName => {
-      const sourceConnections = workflow.connections[sourceName];
-      Object.keys(sourceConnections).forEach(outputName => {
-        sourceConnections[outputName] = sourceConnections[outputName].map(connections =>
-          connections.filter(conn => conn.node !== node.name)
-        ).filter(connections => connections.length > 0);
-        
-        // Clean up empty arrays
-        if (sourceConnections[outputName].length === 0) {
+    for (const [sourceName, sourceConnections] of Object.entries(workflow.connections)) {
+      for (const [outputName, outputConns] of Object.entries(sourceConnections)) {
+        sourceConnections[outputName] = outputConns.map(branch =>
+          filterBranch(branch, conn => conn.node !== node.name)
+        );
+
+        const trimmed = sourceConnections[outputName];
+        trimTrailingEmptyBranches(trimmed);
+
+        if (trimmed.length === 0) {
           delete sourceConnections[outputName];
         }
-      });
-      
+      }
+
       // Clean up empty connection objects
       if (Object.keys(sourceConnections).length === 0) {
         delete workflow.connections[sourceName];
       }
-    });
+    }
   }
 
   private applyUpdateNode(workflow: Workflow, operation: UpdateNodeOperation): void {
     const node = this.findNode(workflow, operation.nodeId, operation.nodeName);
     if (!node) return;
 
-    // Track node renames for connection reference updates
-    if (operation.updates.name && operation.updates.name !== node.name) {
-      const oldName = node.name;
-      const newName = operation.updates.name;
-      this.renameMap.set(oldName, newName);
-      logger.debug(`Tracking rename: "${oldName}" → "${newName}"`);
-    }
+    this.modifiedNodeIds.add(node.id);
+
+    // Capture (but do not yet commit) a potential rename. The renameMap drives
+    // the per-op flushPendingRenames() that rewrites connection references, so
+    // a stale entry from a failed updateNode would corrupt every later op in
+    // continueOnError mode. Commit only after the updates loop + sanitization
+    // complete and node.name actually changed.
+    const pendingRename = operation.updates.name && operation.updates.name !== node.name
+      ? { oldName: node.name, newName: operation.updates.name }
+      : undefined;
+
+    // Apply updates to a draft: a path that throws halfway through the object
+    // (e.g. after auto-creating an intermediate) would otherwise leave the node
+    // half-updated, and in continueOnError mode a later operation would persist
+    // that state. The draft is swapped in only once every update succeeded.
+    const draft: WorkflowNode = JSON.parse(JSON.stringify(node));
 
     // Apply updates using dot notation
-    Object.entries(operation.updates).forEach(([path, value]) => {
-      this.setNestedProperty(node, path, value);
+    this.orderUpdateEntries(operation.updates).forEach(([path, value]) => {
+      // Handle __patch_find_replace for surgical string edits (#642)
+      // Format and type validation already passed in validateUpdateNode()
+      if (value !== null && typeof value === 'object' && !Array.isArray(value)
+          && '__patch_find_replace' in value) {
+        const patches = value.__patch_find_replace as Array<{ find: string; replace: string }>;
+        const original = this.getNestedProperty(draft, path) as string;
+        let current = original;
+        for (const patch of patches) {
+          if (!current.includes(patch.find)) {
+            this.warnings.push({
+              operation: -1,
+              message: `__patch_find_replace: "${patch.find.substring(0, 50)}" not found in "${path}". Skipped.`
+            });
+            continue;
+          }
+          // Function replacer keeps the replacement verbatim — a bare string would
+          // read "$&", "$'" etc. in it as JS replacement patterns (#1012).
+          current = current.replace(patch.find, () => patch.replace);
+        }
+        assertPatchedJsSyntax('__patch_find_replace', path, current, original);
+        this.setNestedProperty(draft, path, current);
+      } else {
+        this.setNestedProperty(draft, path, value);
+      }
     });
 
-    // Sanitize node after updates to ensure metadata is complete
-    const sanitized = sanitizeNode(node);
+    // Sanitize the draft after updates to ensure metadata is complete, then swap
+    // it in without replacing the node object itself — the workflow arrays and
+    // the rename bookkeeping hold this reference.
+    const sanitized = sanitizeNode(draft);
+    for (const key of Object.keys(node)) {
+      if (!Object.prototype.hasOwnProperty.call(sanitized, key)) {
+        delete (node as any)[key];
+      }
+    }
+    Object.assign(node, sanitized);
 
-    // Update the node in-place
+    // Commit the rename only after updates+sanitization succeeded and the
+    // rename actually landed on the node. Guards against phantom rename
+    // entries when an earlier update path threw (Copilot review on #789).
+    if (pendingRename && node.name === pendingRename.newName) {
+      this.renameMap.set(pendingRename.oldName, pendingRename.newName);
+      logger.debug(`Tracking rename: "${pendingRename.oldName}" → "${pendingRename.newName}"`);
+    }
+  }
+
+  /**
+   * Order the updates of one operation so that removals of elements of the same
+   * array run from the highest index down. Splicing "items[0]" before "items[1]"
+   * would shift the array under the second removal and drop the wrong element.
+   * Every other entry keeps its position.
+   */
+  private orderUpdateEntries(updates: Record<string, any>): Array<[string, any]> {
+    const entries = Object.entries(updates);
+    const removalsByParent = new Map<string, Array<{ position: number; index: number }>>();
+
+    entries.forEach(([path, value], position) => {
+      if (value !== null && value !== undefined) return;
+
+      const segments = parsePropertyPath(path);
+      const lastSegment = segments[segments.length - 1];
+      if (!/^\d+$/.test(lastSegment.key)) return;
+
+      const parent = segments.slice(0, -1).map(s => s.key).join('.');
+      const removals = removalsByParent.get(parent) ?? [];
+      removals.push({ position, index: Number(lastSegment.key) });
+      removalsByParent.set(parent, removals);
+    });
+
+    const ordered = [...entries];
+    for (const removals of removalsByParent.values()) {
+      if (removals.length < 2) continue;
+      const descending = [...removals].sort((a, b) => b.index - a.index);
+      removals.forEach(({ position }, i) => {
+        ordered[position] = entries[descending[i].position];
+      });
+    }
+
+    return ordered;
+  }
+
+  private applyPatchNodeField(workflow: Workflow, operation: PatchNodeFieldOperation): void {
+    const node = this.findNode(workflow, operation.nodeId, operation.nodeName);
+    if (!node) return;
+
+    this.modifiedNodeIds.add(node.id);
+
+    const original = this.getNestedProperty(node, operation.fieldPath) as string;
+    let current = original;
+
+    for (let i = 0; i < operation.patches.length; i++) {
+      const patch = operation.patches[i];
+
+      if (patch.regex) {
+        const globalRegex = new RegExp(patch.find, 'g');
+        const matches = current.match(globalRegex);
+
+        if (!matches || matches.length === 0) {
+          throw new Error(
+            `patchNodeField: regex pattern "${patch.find}" not found in "${operation.fieldPath}" (patch index ${i}). ` +
+            `Use n8n_get_workflow to inspect the current value.`
+          );
+        }
+
+        if (matches.length > 1 && !patch.replaceAll) {
+          throw new Error(
+            `patchNodeField: regex pattern "${patch.find}" matches ${matches.length} times in "${operation.fieldPath}" (patch index ${i}). ` +
+            `Set "replaceAll": true to replace all occurrences, or refine the pattern to match exactly once.`
+          );
+        }
+
+        const regex = patch.replaceAll ? globalRegex : new RegExp(patch.find);
+        current = current.replace(regex, patch.replace);
+      } else {
+        const occurrences = countOccurrences(current, patch.find);
+
+        if (occurrences === 0) {
+          throw new Error(
+            `patchNodeField: "${patch.find.substring(0, 80)}" not found in "${operation.fieldPath}" (patch index ${i}). ` +
+            `Ensure the find string exactly matches the current content (including whitespace and newlines). ` +
+            `Use n8n_get_workflow to inspect the current value.`
+          );
+        }
+
+        if (occurrences > 1 && !patch.replaceAll) {
+          throw new Error(
+            `patchNodeField: "${patch.find.substring(0, 80)}" found ${occurrences} times in "${operation.fieldPath}" (patch index ${i}). ` +
+            `Set "replaceAll": true to replace all occurrences, or use a more specific find string that matches exactly once.`
+          );
+        }
+
+        // split/join inserts the replacement verbatim; String.replace would read
+        // "$&", "$'" and friends in it as JS replacement patterns (#1012). Safe
+        // for the single-occurrence case too: the checks above leave exactly one.
+        current = current.split(patch.find).join(patch.replace);
+      }
+    }
+
+    assertPatchedJsSyntax('patchNodeField', operation.fieldPath, current, original);
+    this.setNestedProperty(node, operation.fieldPath, current);
+
+    // Sanitize node after updates
+    const sanitized = sanitizeNode(node);
     Object.assign(node, sanitized);
   }
 
   private applyMoveNode(workflow: Workflow, operation: MoveNodeOperation): void {
     const node = this.findNode(workflow, operation.nodeId, operation.nodeName);
     if (!node) return;
-    
+
     node.position = operation.position;
   }
 
@@ -702,13 +1410,24 @@ export class WorkflowDiffEngine {
    */
   private resolveSmartParameters(
     workflow: Workflow,
-    operation: AddConnectionOperation | RewireConnectionOperation
+    operation: AddConnectionOperation | RewireConnectionOperation,
+    options: { silent?: boolean } = {}
   ): { sourceOutput: string; sourceIndex: number } {
     const sourceNode = this.findNode(workflow, operation.source, operation.source);
 
-    // Start with explicit values or defaults
-    let sourceOutput = operation.sourceOutput ?? 'main';
+    // Start with explicit values or defaults, coercing to correct types
+    let sourceOutput = String(operation.sourceOutput ?? 'main');
     let sourceIndex = operation.sourceIndex ?? 0;
+
+    // Remap numeric sourceOutput (e.g., "0", "1") to "main" with sourceIndex (#537, #659)
+    // Skip when smart parameters (branch, case) are present — they take precedence
+    const numericOutput = /^\d+$/.test(sourceOutput) ? parseInt(sourceOutput, 10) : null;
+    if (numericOutput !== null
+        && (operation.sourceIndex === undefined || operation.sourceIndex === numericOutput)
+        && operation.branch === undefined && operation.case === undefined) {
+      sourceIndex = numericOutput;
+      sourceOutput = 'main';
+    }
 
     // Smart parameter: branch (for IF nodes)
     // IF nodes use 'main' output with index 0 (true) or 1 (false)
@@ -726,8 +1445,10 @@ export class WorkflowDiffEngine {
       sourceIndex = operation.case;
     }
 
-    // Validation: Warn if using sourceIndex with If/Switch nodes without smart parameters
-    if (sourceNode && operation.sourceIndex !== undefined && operation.branch === undefined && operation.case === undefined) {
+    // Validation: Warn if using sourceIndex with If/Switch nodes without smart parameters.
+    // Suppressed when called from validate path so warnings don't double-fire (apply phase
+    // calls this same helper and is responsible for the user-facing warning).
+    if (!options.silent && sourceNode && operation.sourceIndex !== undefined && operation.branch === undefined && operation.case === undefined) {
       if (sourceNode.type === 'n8n-nodes-base.if') {
         this.warnings.push({
           operation: -1,  // Not tied to specific operation index in request
@@ -758,7 +1479,12 @@ export class WorkflowDiffEngine {
 
     // Use nullish coalescing to properly handle explicit 0 values
     // Default targetInput to sourceOutput to preserve connection type for AI connections (ai_tool, ai_memory, etc.)
-    const targetInput = operation.targetInput ?? sourceOutput;
+    // Coerce to string to handle numeric values passed as sourceOutput/targetInput
+    let targetInput = String(operation.targetInput ?? sourceOutput);
+    // Remap numeric targetInput (e.g., "0") to "main" — connection types are named strings (#659)
+    if (/^\d+$/.test(targetInput)) {
+      targetInput = 'main';
+    }
     const targetIndex = operation.targetIndex ?? 0;
 
     // Initialize source node connections object
@@ -795,28 +1521,21 @@ export class WorkflowDiffEngine {
   private applyRemoveConnection(workflow: Workflow, operation: RemoveConnectionOperation): void {
     const sourceNode = this.findNode(workflow, operation.source, operation.source);
     const targetNode = this.findNode(workflow, operation.target, operation.target);
-    // If ignoreErrors is true, silently succeed even if nodes don't exist
     if (!sourceNode || !targetNode) {
-      if (operation.ignoreErrors) {
-        return; // Gracefully handle missing nodes
-      }
-      return; // Should never reach here if validation passed, but safety check
+      return;
     }
     
-    const sourceOutput = operation.sourceOutput || 'main';
+    const sourceOutput = String(operation.sourceOutput ?? 'main');
     const connections = workflow.connections[sourceNode.name]?.[sourceOutput];
     if (!connections) return;
-    
+
     // Remove connection from all indices
-    workflow.connections[sourceNode.name][sourceOutput] = connections.map(conns =>
-      conns.filter(conn => conn.node !== targetNode.name)
+    workflow.connections[sourceNode.name][sourceOutput] = connections.map(branch =>
+      filterBranch(branch, conn => conn.node !== targetNode.name)
     );
 
-    // Remove trailing empty arrays only (preserve intermediate empty arrays to maintain indices)
     const outputConnections = workflow.connections[sourceNode.name][sourceOutput];
-    while (outputConnections.length > 0 && outputConnections[outputConnections.length - 1].length === 0) {
-      outputConnections.pop();
-    }
+    trimTrailingEmptyBranches(outputConnections);
 
     if (outputConnections.length === 0) {
       delete workflow.connections[sourceNode.name][sourceOutput];
@@ -836,28 +1555,84 @@ export class WorkflowDiffEngine {
    * @param operation - Rewire operation specifying source, from, and to
    */
   private applyRewireConnection(workflow: Workflow, operation: RewireConnectionOperation): void {
+    // Resolve all three node refs up front so downstream calls never operate on
+    // half-resolved inputs. This prevents the silent-corruption case where an
+    // un-resolvable "from" caused removeConnection to no-op while addConnection
+    // still appended a duplicate edge to "to". Fail loudly instead.
+    const sourceNode = this.findNode(workflow, operation.source, operation.source);
+    const fromNode = this.findNode(workflow, operation.from, operation.from);
+    const toNode = this.findNode(workflow, operation.to, operation.to);
+    if (!sourceNode || !fromNode || !toNode) {
+      throw new Error(
+        `rewireConnection: unresolved node reference(s). ` +
+        `source=${JSON.stringify(operation.source)} (${sourceNode ? 'ok' : 'missing'}), ` +
+        `from=${JSON.stringify(operation.from)} (${fromNode ? 'ok' : 'missing'}), ` +
+        `to=${JSON.stringify(operation.to)} (${toNode ? 'ok' : 'missing'}). ` +
+        `Available nodes: ${workflow.nodes.map(n => `"${n.name}" (${n.id})`).join(', ')}`
+      );
+    }
+
+    // Catch the case where "from" and "to" are different strings (one ID, one
+    // name) that resolve to the same node. The string-level guard in the
+    // validator only covers identical inputs; this covers the aliased case.
+    if (fromNode.id === toNode.id) {
+      throw new Error(
+        `rewireConnection: "from" and "to" resolve to the same node "${fromNode.name}" (id: ${fromNode.id}). ` +
+        `A rewire requires a distinct target.`
+      );
+    }
+
     // Resolve smart parameters (branch, case) to technical parameters
     const { sourceOutput, sourceIndex } = this.resolveSmartParameters(workflow, operation);
 
-    // First, remove the old connection (source → from)
+    // Count edges to "from" across ALL sourceIndex slots on this output,
+    // because `applyRemoveConnection` filters by target node name across the
+    // entire output (not just the specific sourceIndex). A per-slot count
+    // would throw spuriously when multiple edges to "from" existed.
+    const totalFromEdges = (): number => {
+      const slots = workflow.connections[sourceNode.name]?.[sourceOutput] ?? [];
+      return slots.reduce((acc, slot) => acc + (slot ?? []).filter(c => c.node === fromNode.name).length, 0);
+    };
+    const fromEdgesBefore = totalFromEdges();
+    const toAlreadyPresent = (workflow.connections[sourceNode.name]?.[sourceOutput]?.[sourceIndex] ?? [])
+      .some(c => c.node === toNode.name);
+
+    // Remove source → from using resolved names (not raw op strings, which may
+    // be IDs that the inner apply would have to re-resolve).
     this.applyRemoveConnection(workflow, {
       type: 'removeConnection',
-      source: operation.source,
-      target: operation.from,
+      source: sourceNode.name,
+      target: fromNode.name,
       sourceOutput: sourceOutput,
       targetInput: operation.targetInput
     });
 
-    // Then, add the new connection (source → to)
-    this.applyAddConnection(workflow, {
-      type: 'addConnection',
-      source: operation.source,
-      target: operation.to,
-      sourceOutput: sourceOutput,
-      targetInput: operation.targetInput,
-      sourceIndex: sourceIndex,
-      targetIndex: 0 // Default target index for new connection
-    });
+    // Skip the add if "to" was already connected at this slot — otherwise a
+    // rewire where "to" is already a target would silently duplicate the edge.
+    if (!toAlreadyPresent) {
+      this.applyAddConnection(workflow, {
+        type: 'addConnection',
+        source: sourceNode.name,
+        target: toNode.name,
+        sourceOutput: sourceOutput,
+        targetInput: operation.targetInput,
+        sourceIndex: sourceIndex,
+        targetIndex: 0
+      });
+    }
+
+    // Invariant: all edges to "from" on this output must now be gone, since
+    // applyRemoveConnection strips every match. If any remain, the map is
+    // corrupted — refuse to commit. The diff engine's atomic rollback
+    // surfaces the throw to the caller.
+    const fromEdgesAfter = totalFromEdges();
+    if (fromEdgesBefore > 0 && fromEdgesAfter !== 0) {
+      throw new Error(
+        `rewireConnection invariant violated: "${sourceNode.name}" → "${fromNode.name}" ` +
+        `edges should have been removed (had ${fromEdgesBefore}, still have ${fromEdgesAfter}). ` +
+        `Refusing to commit a corrupted connection map.`
+      );
+    }
   }
 
   // Metadata operation appliers
@@ -876,21 +1651,199 @@ export class WorkflowDiffEngine {
     workflow.name = operation.name;
   }
 
-  private applyAddTag(workflow: Workflow, operation: AddTagOperation): void {
-    if (!workflow.tags) {
-      workflow.tags = [];
+  /**
+   * Validate a canvas-group replacement.
+   *
+   * Only checks that cannot be wrong on any n8n version: references resolve, names are usable and
+   * unique, no node is claimed twice, no group is empty. Whether the members form a groupable shape
+   * (connected run, no trigger) is n8n's call — it validates on write and names the offending group,
+   * and a local reimplementation of those rules would drift from the running instance.
+   *
+   * References resolve against the workflow as it stands at this point in the batch, so a group
+   * covering a node added by a later operation must come after it.
+   */
+  private validateSetNodeGroups(workflow: Workflow, operation: SetNodeGroupsOperation): string | null {
+    const groups = operation.nodeGroups;
+    if (!Array.isArray(groups)) {
+      return `setNodeGroups requires a "nodeGroups" array. Pass every group you want to keep, or [] to ungroup everything. Example: {type: "setNodeGroups", nodeGroups: [{name: "Enrich lead", nodeNames: ["Fetch company", "Score lead"]}]}`;
     }
-    if (!workflow.tags.includes(operation.tag)) {
-      workflow.tags.push(operation.tag);
+
+    const seenNames = new Set<string>();
+    const claimedNodes = new Map<string, string>();
+
+    for (const group of groups) {
+      if (!group || typeof group !== 'object') {
+        return `setNodeGroups: every entry must be an object like {name: "Enrich lead", nodeNames: ["Fetch company", "Score lead"]}`;
+      }
+
+      const name = typeof group.name === 'string' ? group.name.trim() : '';
+      if (!name) {
+        return `setNodeGroups: every group needs a non-empty "name"`;
+      }
+      if (seenNames.has(name)) {
+        return `setNodeGroups: duplicate group name "${name}". n8n requires group names to be unique.`;
+      }
+      seenNames.add(name);
+
+      // This operation's payload is unvalidated (`z.any()` in the tool schema), so every field is
+      // checked here. Without it a non-string member reaches normalizeNodeName() and a non-string
+      // id reaches toWorkflowNodeGroup(), each throwing a bare "trim is not a function" instead of
+      // a message the caller can act on.
+      if (group.id !== undefined && (typeof group.id !== 'string' || !group.id.trim())) {
+        return `setNodeGroups: group "${name}" has a non-string "id". Omit it to have one generated.`;
+      }
+
+      if (group.description !== undefined) {
+        if (typeof group.description !== 'string') {
+          return `setNodeGroups: group "${name}" has a non-string "description"`;
+        }
+        if (group.description.trim().length > GROUP_DESCRIPTION_MAX_LENGTH) {
+          return `setNodeGroups: group "${name}" has a description of ${group.description.trim().length} characters; n8n allows at most ${GROUP_DESCRIPTION_MAX_LENGTH}.`;
+        }
+      }
+
+      const hasNames = Array.isArray(group.nodeNames) && group.nodeNames.length > 0;
+      const hasIds = Array.isArray(group.nodeIds) && group.nodeIds.length > 0;
+      if (hasNames === hasIds) {
+        return hasNames
+          ? `setNodeGroups: group "${name}" sets both "nodeNames" and "nodeIds" — use one or the other`
+          : `setNodeGroups: group "${name}" needs members in "nodeNames" (or "nodeIds")`;
+      }
+
+      const members = hasIds ? group.nodeIds! : group.nodeNames!;
+      // findIndex, not find: a member that IS `undefined` would make find() return undefined and
+      // skip the very guard meant to catch it.
+      const badIndex = members.findIndex(member => typeof member !== 'string' || !member.trim());
+      if (badIndex !== -1) {
+        return `setNodeGroups: group "${name}" has a member that is not a node ${hasIds ? 'ID' : 'name'} (${JSON.stringify(members[badIndex])})`;
+      }
+
+      const resolvedMembers = this.resolveGroupMembers(workflow, group);
+      if (typeof resolvedMembers === 'string') return resolvedMembers;
+
+      for (const node of resolvedMembers) {
+        const owner = claimedNodes.get(node.id);
+        // Listing a node twice inside one group is a harmless duplicate — the member set is the
+        // same either way, and applySetNodeGroups dedupes it. Only a claim by a DIFFERENT group
+        // is a conflict n8n would reject.
+        if (owner && owner !== name) {
+          return `setNodeGroups: node "${node.name}" is in both "${owner}" and "${name}" — a node can only belong to one group`;
+        }
+        claimedNodes.set(node.id, name);
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Resolve a group's members to nodes, or return an error message.
+   * IDs match exactly and names match normalized — unlike findNode(), an unresolved ID is never
+   * retried as a name, because these fields say which one they are.
+   */
+  private resolveGroupMembers(
+    workflow: Workflow,
+    group: SetNodeGroupsOperation['nodeGroups'][number]
+  ): WorkflowNode[] | string {
+    const label = group.name?.trim() || group.id || 'unnamed group';
+    const resolved: WorkflowNode[] = [];
+
+    // Non-emptiness, matching validateSetNodeGroups exactly: an empty `nodeIds` next to a populated
+    // `nodeNames` must resolve by name, not silently produce a memberless group.
+    if (Array.isArray(group.nodeIds) && group.nodeIds.length > 0) {
+      for (const nodeId of group.nodeIds) {
+        const node = workflow.nodes.find(n => n.id === nodeId);
+        if (!node) {
+          return `setNodeGroups: group "${label}" references node ID "${nodeId}", which is not in the workflow. ${this.formatNodeNotFoundError(workflow, nodeId, 'setNodeGroups')}`;
+        }
+        resolved.push(node);
+      }
+      return resolved;
+    }
+
+    for (const nodeName of group.nodeNames ?? []) {
+      const normalized = this.normalizeNodeName(nodeName);
+      const node = workflow.nodes.find(n => this.normalizeNodeName(n.name) === normalized);
+      if (!node) {
+        return `setNodeGroups: group "${label}" references node "${nodeName}", which is not in the workflow. ${this.formatNodeNotFoundError(workflow, nodeName, 'setNodeGroups')}`;
+      }
+      resolved.push(node);
+    }
+    return resolved;
+  }
+
+  private applySetNodeGroups(workflow: Workflow, operation: SetNodeGroupsOperation): void {
+    const groups: WorkflowNodeGroup[] = [];
+
+    for (const group of operation.nodeGroups) {
+      const members = this.resolveGroupMembers(workflow, group);
+      // Unreachable: validateSetNodeGroups resolved the same members first. If the two ever
+      // disagree, fail loudly rather than write a group validation never approved.
+      if (typeof members === 'string') throw new Error(members);
+
+      const resolved = toWorkflowNodeGroup({
+        id: group.id,
+        name: group.name,
+        // Deduped: a node listed twice in one group is a typo, not a different member set.
+        nodeIds: [...new Set(members.map(node => node.id))],
+        description: group.description
+      });
+      groups.push(resolved);
+      this.authoredGroupNames.add(resolved.name);
+    }
+
+    workflow.nodeGroups = groups;
+  }
+
+  private authoredGroupNamesOrUndefined(): string[] | undefined {
+    return this.authoredGroupNames.size > 0 ? [...this.authoredGroupNames] : undefined;
+  }
+
+  /**
+   * Reconcile canvas groups with the finished graph, once, before returning.
+   *
+   * Runs at the end rather than inside removeNode so a node removed and re-added within the same
+   * batch keeps its membership, and so a group is judged against the final graph instead of an
+   * intermediate one.
+   */
+  private finalizeNodeGroups(workflow: Workflow): void {
+    if (!Array.isArray(workflow.nodeGroups) || workflow.nodeGroups.length === 0) return;
+
+    // Deliberately WITHOUT authoredGroups, unlike the client's pre-write repair. There, a group
+    // referencing a node that does not exist is a mistake in the request. Here the only way an
+    // authored group can lose a member is that the same batch removed it — an explicit instruction,
+    // not a typo — so pruning with a warning is the honest outcome. A group naming a node that was
+    // never in the workflow is already rejected by validateSetNodeGroups, before this runs.
+    const { nodeGroups, issues } = repairNodeGroups(workflow);
+    workflow.nodeGroups = nodeGroups;
+
+    for (const issue of issues) {
+      // -1: the adjustment belongs to the batch as a whole, not one operation.
+      this.warnings.push({ operation: -1, message: issue.message });
+    }
+  }
+
+  private applyAddTag(workflow: Workflow, operation: AddTagOperation): void {
+    // Track for dedicated API call instead of modifying workflow.tags directly
+    // Reconcile: if previously marked for removal, cancel the removal instead
+    const removeIdx = this.tagsToRemove.indexOf(operation.tag);
+    if (removeIdx !== -1) {
+      this.tagsToRemove.splice(removeIdx, 1);
+    }
+    if (!this.tagsToAdd.includes(operation.tag)) {
+      this.tagsToAdd.push(operation.tag);
     }
   }
 
   private applyRemoveTag(workflow: Workflow, operation: RemoveTagOperation): void {
-    if (!workflow.tags) return;
-
-    const index = workflow.tags.indexOf(operation.tag);
-    if (index !== -1) {
-      workflow.tags.splice(index, 1);
+    // Track for dedicated API call instead of modifying workflow.tags directly
+    // Reconcile: if previously marked for addition, cancel the addition instead
+    const addIdx = this.tagsToAdd.indexOf(operation.tag);
+    if (addIdx !== -1) {
+      this.tagsToAdd.splice(addIdx, 1);
+    }
+    if (!this.tagsToRemove.includes(operation.tag)) {
+      this.tagsToRemove.push(operation.tag);
     }
   }
 
@@ -916,15 +1869,46 @@ export class WorkflowDiffEngine {
 
   // Workflow activation operation appliers
   private applyActivateWorkflow(workflow: Workflow, operation: ActivateWorkflowOperation): void {
-    // Set flag in workflow object to indicate activation intent
-    // The handler will call the API method after workflow update
+    // Activate / deactivate flags are mutually exclusive — clear the opposite
+    // so a batch like [activateWorkflow, deactivateWorkflow] ends with
+    // last-op-wins semantics instead of first-wins (QA #8).
     (workflow as any)._shouldActivate = true;
+    (workflow as any)._shouldDeactivate = false;
   }
 
   private applyDeactivateWorkflow(workflow: Workflow, operation: DeactivateWorkflowOperation): void {
-    // Set flag in workflow object to indicate deactivation intent
-    // The handler will call the API method after workflow update
     (workflow as any)._shouldDeactivate = true;
+    (workflow as any)._shouldActivate = false;
+  }
+
+  /**
+   * Folder move (n8n 2.32+) — rides the regular PUT body as write-only
+   * `parentFolderId`: null means project root, a string names the target
+   * folder. Whether the folder exists is n8n's call on write.
+   */
+  private validateMoveToFolder(_workflow: Workflow, operation: MoveToFolderOperation): string | null {
+    const target = operation.parentFolderId;
+    if (target !== null && (typeof target !== 'string' || target.trim().length === 0)) {
+      return 'moveToFolder requires parentFolderId to be a non-empty folder ID string, or null for the project root';
+    }
+    return null;
+  }
+
+  private applyMoveToFolder(workflow: Workflow, operation: MoveToFolderOperation): void {
+    const target = operation.parentFolderId;
+    workflow.parentFolderId = target === null ? null : target.trim();
+  }
+
+  // Transfer operation — uses dedicated API call (PUT /workflows/{id}/transfer)
+  private validateTransferWorkflow(_workflow: Workflow, operation: TransferWorkflowOperation): string | null {
+    if (!operation.destinationProjectId) {
+      return 'transferWorkflow requires a non-empty destinationProjectId string';
+    }
+    return null;
+  }
+
+  private applyTransferWorkflow(_workflow: Workflow, operation: TransferWorkflowOperation): void {
+    this.transferToProjectId = operation.destinationProjectId;
   }
 
   // Connection cleanup operation validators
@@ -934,6 +1918,11 @@ export class WorkflowDiffEngine {
   }
 
   private validateReplaceConnections(workflow: Workflow, operation: ReplaceConnectionsOperation): string | null {
+    // `connections` is z.any() on the wire, and Object.entries below throws on a missing one.
+    if (!operation.connections || typeof operation.connections !== 'object' || Array.isArray(operation.connections)) {
+      return `The replaceConnections operation requires a 'connections' object, received ${describeValueType(operation.connections)}`;
+    }
+
     // Validate that all referenced nodes exist
     const nodeNames = new Set(workflow.nodes.map(n => n.name));
 
@@ -942,11 +1931,32 @@ export class WorkflowDiffEngine {
         return `Source node not found in connections: ${sourceName}`;
       }
 
+      // The nested shape is as untyped as the root - a null output map or connection entry
+      // read straight through would abort the whole batch as a diff-engine error (#1092).
+      if (!outputs || typeof outputs !== 'object' || Array.isArray(outputs)) {
+        return `Connections for "${sourceName}" must be an object keyed by output name, received ${describeValueType(outputs)}`;
+      }
+
       // outputs is the value from Object.entries, need to iterate its keys
       for (const outputName of Object.keys(outputs)) {
         const connections = outputs[outputName];
+        if (!Array.isArray(connections)) {
+          return `Connections for "${sourceName}" output "${outputName}" must be an array of output arrays, received ${describeValueType(connections)}`;
+        }
+
         for (const conns of connections) {
+          // A caller may send back a shape it read from n8n, null branches included (#1096).
+          // Only other non-arrays are rejected.
+          if (conns === null) continue;
+          if (!Array.isArray(conns)) {
+            return `Connections for "${sourceName}" output "${outputName}" must contain arrays of connections, received ${describeValueType(conns)}`;
+          }
+
           for (const conn of conns) {
+            if (!conn || typeof conn !== 'object' || typeof conn.node !== 'string') {
+              return `Each connection from "${sourceName}" output "${outputName}" must be an object with a string "node", received ${describeValueType(conn)}`;
+            }
+
             if (!nodeNames.has(conn.node)) {
               return `Target node not found in connections: ${conn.node}`;
             }
@@ -969,7 +1979,7 @@ export class WorkflowDiffEngine {
         if (!nodeNames.has(sourceName)) {
           for (const [outputName, connections] of Object.entries(outputs)) {
             for (const conns of connections) {
-              for (const conn of conns) {
+              for (const conn of branchConnections(conns)) {
                 staleConnections.push({ from: sourceName, to: conn.node });
               }
             }
@@ -977,7 +1987,7 @@ export class WorkflowDiffEngine {
         } else {
           for (const [outputName, connections] of Object.entries(outputs)) {
             for (const conns of connections) {
-              for (const conn of conns) {
+              for (const conn of branchConnections(conns)) {
                 if (!nodeNames.has(conn.node)) {
                   staleConnections.push({ from: sourceName, to: conn.node });
                 }
@@ -996,7 +2006,7 @@ export class WorkflowDiffEngine {
       if (!nodeNames.has(sourceName)) {
         for (const [outputName, connections] of Object.entries(outputs)) {
           for (const conns of connections) {
-            for (const conn of conns) {
+            for (const conn of branchConnections(conns)) {
               staleConnections.push({ from: sourceName, to: conn.node });
             }
           }
@@ -1007,15 +2017,17 @@ export class WorkflowDiffEngine {
 
       // Check each connection
       for (const [outputName, connections] of Object.entries(outputs)) {
-        const filteredConnections = connections.map(conns =>
-          conns.filter(conn => {
+        const filteredConnections = connections.map(branch =>
+          filterBranch(branch, conn => {
             if (!nodeNames.has(conn.node)) {
               staleConnections.push({ from: sourceName, to: conn.node });
               return false;
             }
             return true;
           })
-        ).filter(conns => conns.length > 0);
+        );
+
+        trimTrailingEmptyBranches(filteredConnections);
 
         if (filteredConnections.length === 0) {
           delete outputs[outputName];
@@ -1048,6 +2060,14 @@ export class WorkflowDiffEngine {
    *
    * @param workflow - The workflow to update
    */
+  private flushPendingRenames(workflow: Workflow): void {
+    if (this.renameMap.size === 0) return;
+
+    this.updateConnectionReferences(workflow);
+    logger.debug(`Auto-updated ${this.renameMap.size} node name references in connections`);
+    this.renameMap.clear();
+  }
+
   private updateConnectionReferences(workflow: Workflow): void {
     if (this.renameMap.size === 0) return;
 
@@ -1068,16 +2088,16 @@ export class WorkflowDiffEngine {
     for (const [sourceName, outputs] of Object.entries(updatedConnections)) {
       // Iterate through all output types (main, error, ai_tool, ai_languageModel, etc.)
       for (const [outputType, connections] of Object.entries(outputs)) {
-        // connections is Array<Array<{node, type, index}>>
         for (let outputIndex = 0; outputIndex < connections.length; outputIndex++) {
-          const connectionsAtIndex = connections[outputIndex];
+          const connectionsAtIndex = branchConnections(connections[outputIndex]);
           for (let connIndex = 0; connIndex < connectionsAtIndex.length; connIndex++) {
             const connection = connectionsAtIndex[connIndex];
             // Check if target node was renamed
             if (renames.has(connection.node)) {
+              const oldTargetName = connection.node;
               const newTargetName = renames.get(connection.node)!;
               connection.node = newTargetName;
-              logger.debug(`Updated connection: ${sourceName}[${outputType}][${outputIndex}][${connIndex}].node: "${connection.node}" → "${newTargetName}"`);
+              logger.debug(`Updated connection: ${sourceName}[${outputType}][${outputIndex}][${connIndex}].node: "${oldTargetName}" → "${newTargetName}"`);
             }
           }
         }
@@ -1115,12 +2135,16 @@ export class WorkflowDiffEngine {
    * @returns Normalized node name for safe comparison
    */
   private normalizeNodeName(name: string): string {
+    // Single-pass unescape so sequential replacements can't feed into each
+    // other. Previously we did three separate `.replace()` calls — but
+    // `\\` → `\` first could produce a backslash that the next pass
+    // (`\'` → `'`) treated as an escape sequence, silently dropping a
+    // backslash in inputs like `\\\\'` (correct normalization: `\\'`,
+    // buggy sequential result: `\'`). Addresses CodeQL js/double-escaping.
     return name
-      .trim()                    // Remove leading/trailing whitespace
-      .replace(/\\\\/g, '\\')    // FIRST: Unescape backslashes: \\ -> \ (must be first to handle multiply-escaped chars)
-      .replace(/\\'/g, "'")      // THEN: Unescape single quotes: \' -> '
-      .replace(/\\"/g, '"')      // THEN: Unescape double quotes: \" -> "
-      .replace(/\s+/g, ' ');     // FINALLY: Normalize all whitespace (spaces, tabs, newlines) to single space
+      .trim()
+      .replace(/\\([\\'"])/g, '$1')
+      .replace(/\s+/g, ' ');
   }
 
   /**
@@ -1181,18 +2205,68 @@ export class WorkflowDiffEngine {
     return `Node not found for ${operationType}: "${nodeIdentifier}". Available nodes: ${availableNodes}. Tip: Use node ID for names with special characters (apostrophes, quotes).`;
   }
 
-  private setNestedProperty(obj: any, path: string, value: any): void {
-    const keys = path.split('.');
+  private getNestedProperty(obj: any, path: string): any {
     let current = obj;
-    
-    for (let i = 0; i < keys.length - 1; i++) {
-      const key = keys[i];
-      if (!(key in current) || typeof current[key] !== 'object') {
+    try {
+      for (const segment of parsePropertyPath(path)) {
+        if (DANGEROUS_PATH_KEYS.has(segment.key)) return undefined;
+        if (current == null || typeof current !== 'object') return undefined;
+        const key = resolveSegment(current, segment, path, false);
+        current = current[key];
+      }
+    } catch {
+      // Malformed or unsatisfiable path — the property does not exist.
+      return undefined;
+    }
+    return current;
+  }
+
+  private setNestedProperty(obj: any, path: string, value: any): void {
+    const segments = parsePropertyPath(path);
+    let current = obj;
+
+    // Prototype pollution protection (eager: throw before any write).
+    if (segments.some(s => DANGEROUS_PATH_KEYS.has(s.key))) {
+      throw new Error(`Invalid property path: "${path}" contains a forbidden key`);
+    }
+
+    for (let i = 0; i < segments.length - 1; i++) {
+      const key = resolveSegment(current, segments[i], path, true);
+      // Per-iteration guard. Redundant with the eager check above (which
+      // already throws), but kept so CodeQL's `js/prototype-pollution-utility`
+      // dataflow sees the write site is guarded at the point of assignment.
+      if (typeof key === 'string' && DANGEROUS_PATH_KEYS.has(key)) {
+        throw new Error(`Invalid property path: "${path}" contains a forbidden key`);
+      }
+      if (!Object.prototype.hasOwnProperty.call(current, key)
+          || typeof current[key] !== 'object'
+          || current[key] === null) {
+        // null or undefined signals deletion — if parent path doesn't exist there's nothing to delete
+        if (value === null || value === undefined) return;
         current[key] = {};
       }
       current = current[key];
     }
-    
-    current[keys[keys.length - 1]] = value;
+
+    const finalKey = resolveSegment(current, segments[segments.length - 1], path, true);
+    // Same CodeQL-visible guard at the final write site.
+    if (typeof finalKey === 'string' && DANGEROUS_PATH_KEYS.has(finalKey)) {
+      throw new Error(`Invalid property path: "${path}" contains a forbidden key`);
+    }
+    // Both null and undefined remove the property. undefined is accepted because
+    // workflow-auto-fixer.ts already uses `{prop: undefined}` to signal removal
+    // (see processErrorOutputFixes), so treating only null as the deletion marker
+    // left those fixes silently inert at the diff-engine layer.
+    if (value === null || value === undefined) {
+      // A numeric key only resolves against an array, where deleting in place
+      // would leave a hole that serializes back to n8n as a null element.
+      if (typeof finalKey === 'number') {
+        current.splice(finalKey, 1);
+      } else {
+        delete current[finalKey];
+      }
+    } else {
+      current[finalKey] = value;
+    }
   }
 }

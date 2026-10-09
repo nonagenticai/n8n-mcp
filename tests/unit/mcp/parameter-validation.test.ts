@@ -148,14 +148,11 @@ describe('Parameter Validation', () => {
       vi.spyOn(server as any, 'validateNodeConfig').mockResolvedValue({ valid: true });
       vi.spyOn(server as any, 'validateNodeMinimal').mockResolvedValue({ missing: [] });
       vi.spyOn(server as any, 'getPropertyDependencies').mockResolvedValue({ dependencies: {} });
-      vi.spyOn(server as any, 'getNodeAsToolInfo').mockResolvedValue({ toolInfo: true });
       vi.spyOn(server as any, 'listNodeTemplates').mockResolvedValue({ templates: [] });
       vi.spyOn(server as any, 'getTemplate').mockResolvedValue({ template: {} });
       vi.spyOn(server as any, 'searchTemplates').mockResolvedValue({ templates: [] });
       vi.spyOn(server as any, 'getTemplatesForTask').mockResolvedValue({ templates: [] });
       vi.spyOn(server as any, 'validateWorkflow').mockResolvedValue({ valid: true });
-      vi.spyOn(server as any, 'validateWorkflowConnections').mockResolvedValue({ valid: true });
-      vi.spyOn(server as any, 'validateWorkflowExpressions').mockResolvedValue({ valid: true });
     });
 
     describe('get_node', () => {
@@ -535,12 +532,15 @@ describe('Parameter Validation', () => {
         { name: 'n8n_validate_workflow', args: {}, expected: 'n8n_validate_workflow: Validation failed:\n  • id: id is required' },
       ];
 
-      // n8n_update_partial_workflow and n8n_test_workflow use legacy validation
+      // n8n_update_partial_workflow uses legacy validation; n8n_test_workflow moved to the schema-style format
       await expect(server.testExecuteTool('n8n_update_partial_workflow', {}))
         .rejects.toThrow('Missing required parameters for n8n_update_partial_workflow: id, operations');
 
       await expect(server.testExecuteTool('n8n_test_workflow', {}))
-        .rejects.toThrow('Missing required parameters for n8n_test_workflow: workflowId');
+        .rejects.toThrow('n8n_test_workflow: Validation failed:\n  • workflowId: workflowId is required');
+
+      await expect(server.testExecuteTool('n8n_manage_datatable', {}))
+        .rejects.toThrow('n8n_manage_datatable: Validation failed:\n  • action: action is required');
 
       for (const tool of n8nToolsWithRequiredParams) {
         await expect(server.testExecuteTool(tool.name, tool.args))
