@@ -21,6 +21,6 @@
     "node": ">=20.0.0"
   },
   "optionalDependencies": {
-    "better-sqlite3": "^11.10.0"
+    "better-sqlite3": "^13.0.3"
   }
 }
